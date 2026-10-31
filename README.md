@@ -35,3 +35,9 @@ Run `ci/check`.
 ## License
 
 Released under [GNU GPL version 3 or later](LICENSE).
+
+## One owner per cache
+
+The tools that use abucache (CakeUnbake64, AbuDecomp64, CakeTaste64, RecipeMaker64 and the game repositories unbake
+generates) run `ci/abucache-audit` in their check entry point: a new cache, slot, pool, executor or timing path outside
+abucache is refused with this package named as its owner.
