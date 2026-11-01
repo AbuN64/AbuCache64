@@ -486,3 +486,117 @@ class TestRun:
 
     def test_no_command_is_a_usage_error(self, capsys):
         assert slots.run(["--work", "2"]) == 2
+
+
+def test_a_peer_word_p_marks_the_priority_job_and_a_bad_word_still_does(pool):
+    path = pool / "cmd-1.lock"
+    path.write_text("3 8 p")
+    assert slots._declared(path, 8) == (3, 8, True)
+    path.write_text("p")
+    assert slots._declared(path, 8) == (8, 8, True)
+    path.write_text("3 8")
+    assert slots._declared(path, 8) == (3, 8, False)
+    assert slots._declared(pool / "cmd-2.lock", 8) == (8, 8, False)
+
+
+def test_the_priority_job_splits_first_and_the_others_get_what_it_leaves():
+    a, b, c = Path("a"), Path("b"), Path("c")
+    demands = {a: 8, b: 8, c: 8}
+    assert slots._ranked(8, demands, set(), a) == 3
+    assert slots._ranked(8, demands, {a}, a) == 8
+    assert slots._ranked(8, demands, {a}, b) == 0  # a priority command never waits on a minimum share kept for others
+    assert slots._ranked(8, {a: 3, b: 8, c: 8}, {a}, b) == 3 and slots._ranked(8, {a: 3, b: 8, c: 8}, {a}, c) == 2
+    assert slots._ranked(8, demands, {a, b}, a) == 4 and slots._ranked(8, demands, {a, b}, c) == 0
+
+
+def test_a_priority_command_tells_its_peers_and_the_others_give_way(pool, make_runtime):
+    peer = hold(pool / "cmd-1.lock", "8 8")
+    try:
+        urgent = slots.Slots(make_runtime(workers=8), priority=True)
+        with urgent.cores() as granted:
+            assert granted == 8
+            assert (pool / f"cmd-{os.getpid()}.lock").read_text() == "8 8 p"
+        plain = slots.Slots(make_runtime(workers=8))
+        with plain.cores() as granted:
+            assert granted == 4
+            assert (pool / f"cmd-{os.getpid()}.lock").read_text() == "8 8"
+    finally:
+        drop(peer)
+
+
+def test_the_priority_job_queues_ahead_of_an_older_waiter(pool, make_runtime):
+    older = pool / f"wait-1{1:020d}-{os.getppid()}"
+    older.write_text("")
+    cmd = hold(pool / f"cmd-{os.getppid()}.lock", "1 2")
+    try:
+        plain, urgent = slots.Slots(make_runtime(workers=2)), slots.Slots(make_runtime(workers=2), priority=True)
+        plain._enter(pool)
+        assert plain.ticket[0].name.startswith("wait-1")
+        plain._leave()
+        urgent._enter(pool)
+        assert urgent.ticket[0].name.startswith("wait-0") and urgent._queued(pool) is False
+        urgent._leave()
+    finally:
+        drop(cmd)
+
+
+def test_priority_is_a_field_never_read_from_the_environment(pool, make_runtime, monkeypatch):
+    monkeypatch.setenv("UNBAKE_PRIORITY", "1")
+    mine = slots.Slots(make_runtime(workers=2))
+    assert mine.priority is False
+    mine.configure(None, priority=True)
+    assert mine.priority is True
+    mine.configure(None)
+    assert mine.priority is True  # configuring only a runtime keeps it
+    mine.configure(None, priority=False)
+    assert mine.priority is False
+
+
+def test_a_small_command_takes_the_express_slot_when_every_slot_is_held(pool, make_runtime):
+    cmd = hold(pool / "cmd-1.lock", "1 2")
+    held = [hold(pool / f"slot-{i}.lock") for i in range(2)]
+    try:
+        mine = slots.Slots(make_runtime(workers=2))
+        mine.acquire(cap=slots.EXPRESS_AT)
+        assert [Path(f.name).name for f in mine.slots] == [slots.EXPRESS]
+        mine.release()
+        assert not mine.slots
+    finally:
+        for handle in held:
+            drop(handle)
+        drop(cmd)
+
+
+def test_a_command_over_the_express_cap_does_not_take_it(pool, make_runtime):
+    express = hold(pool / slots.EXPRESS)  # nobody else would be able to take it either way
+    try:
+        mine = slots.Slots(make_runtime(workers=2))
+        mine.acquire(cap=slots.EXPRESS_AT + 1)
+        assert mine.slots and all(Path(f.name).name != slots.EXPRESS for f in mine.slots)
+        mine.release()
+    finally:
+        drop(express)
+
+
+def test_the_priority_flag_of_the_run_command_makes_the_command_the_priority_job(pool, make_runtime, monkeypatch):
+    seen = []
+    loaded = make_runtime(workers=2)
+    monkeypatch.setattr(slots, "default", slots.Slots(loaded))
+    monkeypatch.setattr(slots.runtime_file, "load", lambda *a, **k: loaded)
+
+    class Done:
+        returncode = 0
+
+    monkeypatch.setattr(slots.subprocess, "run", lambda *a, **k: seen.append(slots.default.priority) or Done())
+    assert slots.run(["--priority", "--", "tool", "-j{j}"]) == 0
+    assert seen == [True]
+
+
+def test_the_default_wait_log_is_the_hosts_and_names_the_project(rundir, make_runtime, tmp_path):
+    import json
+
+    stages.configure(project="proj")
+    with stages.command("tool", "work", [], tmp_path / "stages.jsonl"):
+        stages.waited(61.0, "slots", "held by 42")
+    (line,) = [json.loads(row) for row in slots.wait_log().read_text().splitlines()]
+    assert (line["project"], line["what"], line["detail"]) == ("proj", "slots", "held by 42")

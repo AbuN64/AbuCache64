@@ -3,10 +3,17 @@
 """The host's worker slots: every heavy thing on a machine takes its share of the cores from one set of flock files,
 so commands of any tool divide the machine fairly instead of each assuming it owns it.
 
-Wire protocol 2 (frozen): `$XDG_RUNTIME_DIR/unbake-pool-2/` holds `slot-<n>.lock` (one flock per core), `cmd-<pid>.lock`
-(a live command, holding its demand and budget), `wait-<ns>-<pid>` (the queue for a free slot), `wake` (the one file
-whose write-close wakes every waiter) and `waits.jsonl`. `UNBAKE_CORES` hands a held share to a child. Named
-capacities are new files (`cap-<name>/token-<n>.lock`) that no older process reads.
+Wire protocol 2 (frozen): `$XDG_RUNTIME_DIR/unbake-pool-2/` holds `slot-<n>.lock` (one flock per core),
+`slot-express.lock` (one slot beyond the budget, for a command with at most `EXPRESS_AT` chunks), `cmd-<pid>.lock` (a
+live command, holding its demand, its budget and a trailing `p` for the priority job), `wait-<rank><ns>-<pid>` (the
+queue for a free slot; rank 0 is the priority job's, 1 everyone else's), `wake` (the one file whose write-close wakes
+every waiter) and `waits.jsonl` (one line per wait of a minute or more, with the `project` that waited).
+`UNBAKE_CORES` hands a held share to a child. Named capacities are new files (`cap-<name>/token-<n>.lock`) that no older process reads.
+
+The priority job is the one every tree waits on (the ship/land lock holder). It is an explicit field, never read from
+the environment: `Slots(priority=True)`, `configure(runtime, priority=True)` or `python -m abucache.slots --priority`.
+It splits the budget among priority commands first, leaving the others what remains (down to none), and its place in
+the queue sorts ahead of every other waiter's.
 
 A command takes its max-min fair share of the budget (`runtime.workers`), at most the work it has and, when it names
 `task_memory`, at most what the free memory holds. Waits and short shares are stages of the command's tree
@@ -38,6 +45,8 @@ POOL = f"unbake-pool-{PROTOCOL}"  # the slot directory of this protocol, under X
 WAITS = "waits.jsonl"  # in the slot directory: one line per wait of 60 s or more (stages.WAIT_NOTE), whoever waited
 CORES_ENV = "UNBAKE_CORES"  # the cores a holder above this process took for the command
 CAPACITIES_ENV = "ABU_CAPACITIES"  # comma separated capacity names a holder above this process holds for the command
+EXPRESS = "slot-express.lock"  # one slot beyond the host's budget, for commands with at most EXPRESS_AT chunks
+EXPRESS_AT = 2
 REBALANCE = 0.5  # seconds between looks at the other commands while a make feeder works
 CAPACITY_RECHECK = 5.0  # seconds: a capacity waiter also looks again in case a holder died before it wrote its pid
 DEAD_AFTER = 60.0  # seconds a command's lock file must be old before a free one is known to be a finished command's
@@ -165,15 +174,32 @@ def wait_log() -> Path:
     return Path(os.environ.get("XDG_RUNTIME_DIR", "")) / POOL / WAITS
 
 
-def _declared(path: Path, want: int) -> tuple[int, int]:
-    """(the slots a peer said it could use, its budget); a peer that said nothing yet is taken to want all of `want`."""
+def _declared(path: Path, want: int) -> tuple[int, int, bool]:
+    """(the slots a peer said it could use, its budget, whether it is the priority job); a peer that said nothing yet
+    is taken to want all of `want`."""
     try:
         words = path.read_text().split()
     except OSError:
-        return want, want
+        return want, want, False
+    first = words[:1] == ["p"] or words[2:] == ["p"]
+    words = words[:2]
     if len(words) != 2 or not all(w.isdigit() and int(w) > 0 for w in words):
-        return want, want
-    return int(words[0]), int(words[1])
+        return want, want, first
+    return int(words[0]), int(words[1]), first
+
+
+def _ranked(want: int, demands: dict[Path, int], first: set[Path], mine: Path) -> int:
+    """This command's share when some commands are the priority job (`first`): they split `want` among themselves
+    as `_fair` does, and the others split only what they leave, down to no slot at all, so a priority command never
+    waits on slots that commands queued behind it keep by a minimum share."""
+    if not first:
+        return _fair(want, demands, mine)
+    ahead = {p: d for p, d in demands.items() if p in first}
+    if mine in first:
+        return _fair(want, ahead, mine)
+    left = want - min(want, sum(ahead.values()))
+    rest = {p: d for p, d in demands.items() if p not in first}
+    return _fair(left, rest, mine) if left > 0 else 0
 
 
 def _fair(want: int, demands: dict[Path, int], mine: Path) -> int:
@@ -262,8 +288,9 @@ class Slots:
     """One process's holding of the host slots. The module's `default` serves every caller of a process; a test makes
     its own. The budget is `runtime.workers`, read once from the runtime file unless one is passed."""
 
-    def __init__(self, runtime: runtime_file.Runtime | None = None) -> None:
+    def __init__(self, runtime: runtime_file.Runtime | None = None, *, priority: bool = False) -> None:
         self._runtime = runtime
+        self.priority = priority  # the job every tree waits on (the ship/land lock holder): it divides and queues first
         self.slots: list[io.IOBase] = []  # the host-wide slots this process holds now: one flock each, freed on death
         self.dir: list[Path] = []  # the slot directory this process takes from; empty under a holder above it
         self.cmd: list[io.TextIOWrapper] = []  # this command's own lock file: its presence divides the slots fairly
@@ -283,8 +310,10 @@ class Slots:
             self._runtime = runtime_file.load()
         return self._runtime
 
-    def configure(self, runtime: runtime_file.Runtime | None) -> None:
+    def configure(self, runtime: runtime_file.Runtime | None, *, priority: bool | None = None) -> None:
         self._runtime = runtime
+        if priority is not None:
+            self.priority = priority
 
     @property
     def budget(self) -> int:
@@ -319,7 +348,7 @@ class Slots:
         the first, and the largest budget of any live command is how many slot files there are. A change wakes the
         peers' waiters (a jobserver feeder sheds what its share no longer holds)."""
         if self.cmd:
-            fd, said = self.cmd[0].fileno(), f"{count} {budget}".encode()
+            fd, said = self.cmd[0].fileno(), f"{count} {budget}{' p' * self.priority}".encode()
             before = self._said.get(fd)
             if before == said:
                 return
@@ -334,9 +363,10 @@ class Slots:
         many as the largest budget any live command declared, so a command with a small budget takes any free slot of
         them (at most its budget) and never waits on a few low slots while higher ones are free."""
         peers = self._peers(pool, mine)
-        declared = {p: (using or want, want) if p == mine else _declared(p, want) for p in peers}
-        size = max(budget for _, budget in declared.values())
-        return peers, size, _fair(size, {p: demand for p, (demand, _) in declared.items()}, mine)
+        declared = {p: (using or want, want, self.priority) if p == mine else _declared(p, want) for p in peers}
+        size = max(budget for _, budget, _ in declared.values())
+        demands = {p: demand for p, (demand, _, _) in declared.items()}
+        return peers, size, _ranked(size, demands, {p for p, (_, _, first) in declared.items() if first}, mine)
 
     def _memory_slots(self) -> int:
         return memory_slots(self.task_memory, self.runtime.reserve_memory)
@@ -373,7 +403,8 @@ class Slots:
 
     def _enter(self, pool: Path) -> None:
         if not self.ticket:
-            ticket = pool / f"wait-{time.time_ns():020d}-{os.getpid()}"
+            rank = 0 if self.priority else 1  # the priority job's ticket sorts ahead of every other waiter's
+            ticket = pool / f"wait-{rank}{time.time_ns():020d}-{os.getpid()}"
             os.close(os.open(ticket, os.O_WRONLY | os.O_CREAT | os.O_CLOEXEC, 0o600))
             self.ticket.append(ticket)
 
@@ -453,6 +484,9 @@ class Slots:
                     items=take - len(self.slots),
                     findings=[stages.finding("pool.short_slots", reason, blocking=False)],
                 )
+        # a small command never queues behind heavy ones for minutes: it takes the express slot when all are held
+        if not self.slots and cap and cap <= EXPRESS_AT and (slot := _try(pool / EXPRESS)) is not None:
+            self.slots.append(slot)
         if not self.slots:  # every slot is held: wait for whichever frees first, as a stage of its own
             holders = [_pid(p) for p in peers if p != mine]
             self._enter(pool)  # first come, first served: a newer command takes no slot while this one waits
@@ -731,10 +765,10 @@ class Slots:
 default = Slots()
 
 
-def configure(runtime: runtime_file.Runtime | None) -> None:
+def configure(runtime: runtime_file.Runtime | None, *, priority: bool | None = None) -> None:
     """Sets the runtime whose `workers`, `reserve_memory` and `capacities` the module-level calls use (the file named
-    by `ABU_RUNTIME` is read when none was set)."""
-    default.configure(runtime)
+    by `ABU_RUNTIME` is read when none was set). `priority=True` makes this process the job every tree waits on."""
+    default.configure(runtime, priority=priority)
 
 
 def cores(work: int = 0, *, task_memory: int = 0, capacity: str | None = None):
@@ -757,12 +791,16 @@ def _is_make(program: str) -> bool:
 
 
 def run(argv: Sequence[str]) -> int:
-    """The `unbake-run` body: `unbake-run [--work N] [--mem BYTES] [--capacity NAME] [--] CMD...`. Only a CMD whose
+    """The `unbake-run` body: `unbake-run [--priority] [--work N] [--mem BYTES] [--capacity NAME] [--] CMD...`. Only a CMD whose
     arguments contain `{j}` holds a share of the host slots (as `{j}` and UNBAKE_CORES); any other CMD runs directly,
     taking none. `make -j{j}` runs on a jobserver fed from the slot pool, so a build takes its fair share, grows into
     slots other commands free and gives them back as they ask. A raw `make -jN` is invisible to the slots and starves
-    every other command. `--capacity` holds one token of that named capacity for the command's life."""
+    every other command. `--capacity` holds one token of that named capacity for the command's life. `--priority` makes the
+    command the job every tree waits on (the ship/land lock holder): it divides the slots and queues ahead of the rest."""
     args, work, mem, named = list(argv), 0, 0, ""
+    if args[:1] == ["--priority"]:
+        default.configure(default._runtime, priority=True)
+        args = args[1:]
     while args and args[0] in ("--work", "--mem", "--capacity") and len(args) > 1:
         flag, value, args = args[0], args[1], args[2:]
         if flag == "--capacity":
