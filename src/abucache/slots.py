@@ -8,7 +8,8 @@ Wire protocol 2 (frozen): `$XDG_RUNTIME_DIR/unbake-pool-2/` holds `slot-<n>.lock
 live command, holding its demand, its budget and a trailing `p` for the priority job), `wait-<rank><ns>-<pid>` (the
 queue for a free slot; rank 0 is the priority job's, 1 everyone else's), `wake` (the one file whose write-close wakes
 every waiter) and `waits.jsonl` (one line per wait of a minute or more, with the `project` that waited).
-`UNBAKE_CORES` hands a held share to a child. Named capacities are new files (`cap-<name>/token-<n>.lock`) that no older process reads.
+`UNBAKE_CORES` hands a held share to a child. Named capacities are new files (`cap-<name>/token-<n>.lock`) that no
+older process reads.
 
 The priority job is the one every tree waits on (the ship/land lock holder). It is an explicit field, never read from
 the environment: `Slots(priority=True)`, `configure(runtime, priority=True)` or `python -m abucache.slots --priority`.
@@ -791,12 +792,12 @@ def _is_make(program: str) -> bool:
 
 
 def run(argv: Sequence[str]) -> int:
-    """The `unbake-run` body: `unbake-run [--priority] [--work N] [--mem BYTES] [--capacity NAME] [--] CMD...`. Only a CMD whose
-    arguments contain `{j}` holds a share of the host slots (as `{j}` and UNBAKE_CORES); any other CMD runs directly,
+    """The `unbake-run` body: `unbake-run [--priority] [--work N] [--mem BYTES] [--capacity NAME] [--] CMD...`. Only a
+    CMD whose arguments contain `{j}` holds a share of the host slots (as `{j}` and UNBAKE_CORES); any other CMD runs directly,
     taking none. `make -j{j}` runs on a jobserver fed from the slot pool, so a build takes its fair share, grows into
     slots other commands free and gives them back as they ask. A raw `make -jN` is invisible to the slots and starves
-    every other command. `--capacity` holds one token of that named capacity for the command's life. `--priority` makes the
-    command the job every tree waits on (the ship/land lock holder): it divides the slots and queues ahead of the rest."""
+    every other command. `--capacity` holds one token of that named capacity for the command's life. `--priority` makes
+    the command the job every tree waits on (the ship/land lock holder): it divides the slots and queues ahead."""
     args, work, mem, named = list(argv), 0, 0, ""
     if args[:1] == ["--priority"]:
         default.configure(default._runtime, priority=True)
