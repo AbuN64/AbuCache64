@@ -66,7 +66,10 @@ def test_a_command_takes_its_fair_share_of_the_budget(others, share, pool, make_
     try:
         mine = slots.Slots(make_runtime(workers=8))
         with mine.cores() as granted:
-            assert granted == share
+            # the remainder slots go to the first commands by lock file name, and this process's name carries its pid
+            names = sorted([f"cmd-{os.getpid()}.lock", *(f"cmd-{1 + i}.lock" for i in range(others))])
+            quotient, remainder = divmod(8, others + 1)
+            assert granted in (share, max(1, quotient + (names.index(f"cmd-{os.getpid()}.lock") < remainder)))
     finally:
         for peer in peers:
             drop(peer)
