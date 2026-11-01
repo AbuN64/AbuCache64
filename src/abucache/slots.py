@@ -793,8 +793,8 @@ def _is_make(program: str) -> bool:
 
 def run(argv: Sequence[str]) -> int:
     """The `unbake-run` body: `unbake-run [--priority] [--work N] [--mem BYTES] [--capacity NAME] [--] CMD...`. Only a
-    CMD whose arguments contain `{j}` holds a share of the host slots (as `{j}` and UNBAKE_CORES); any other CMD runs directly,
-    taking none. `make -j{j}` runs on a jobserver fed from the slot pool, so a build takes its fair share, grows into
+    CMD whose arguments contain `{j}` holds a share of the host slots (as `{j}` and UNBAKE_CORES); any other CMD runs
+    directly, taking none. `make -j{j}` runs on a jobserver fed from the slot pool, so a build takes its fair share, grows into
     slots other commands free and gives them back as they ask. A raw `make -jN` is invisible to the slots and starves
     every other command. `--capacity` holds one token of that named capacity for the command's life. `--priority` makes
     the command the job every tree waits on (the ship/land lock holder): it divides the slots and queues ahead."""
