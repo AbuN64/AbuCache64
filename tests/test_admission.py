@@ -203,3 +203,26 @@ def test_status_exposes_live_holders_to_consumers(admission):
     finally:
         grant.release()
     assert admission.status()["holders"] == []
+
+
+def test_ticket_publication_cannot_be_deleted_by_a_competing_census(admission, monkeypatch):
+    pool = admission.pool_dir()
+    real_try = slots._try
+    prepared = []
+
+    def competing(path):
+        if path.name.startswith(".admit-"):
+            path.touch()  # exact interleaving: file exists before flock is acquired
+            assert slots.Slots._queue(pool) == []
+            assert path.exists()  # a queue census cannot unlink the unpublished inode
+            prepared.append(path)
+        return real_try(path)
+
+    monkeypatch.setattr(slots, "_try", competing)
+    grant = admission.acquire("batch")
+    try:
+        assert len(prepared) == 1
+        assert not prepared[0].exists()
+        assert admission.status()["holders"][0]["slots"] == [0]
+    finally:
+        grant.release()

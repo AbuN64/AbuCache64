@@ -1003,10 +1003,18 @@ class Admission:
             raise AdmissionError("slots.memory", f"need {need} GiB above floor {self.policy.floor_gib} GiB")
         began = time.monotonic()
         ticket = pool / f"admit-{CLASSES.index(klass)}-{time.time_ns():020d}-{os.getpid()}-{threading.get_ident()}.lock"
-        handle = _try(ticket)
+        pending = ticket.with_name("." + ticket.name)
+        handle = _try(pending)
         if handle is None:
             raise RuntimeError("admission ticket already held")
-        ticket.write_text(json.dumps({"pid": os.getpid(), "label": label, "memory": need, "klass": klass}))
+        info = {"pid": os.getpid(), "label": label, "memory": need, "klass": klass}
+        try:
+            pending.write_text(json.dumps(info))
+            pending.rename(ticket)  # publish only a fully initialized, locked ticket
+        except BaseException:
+            handle.close()
+            pending.unlink(missing_ok=True)
+            raise
         holder = ticket.with_name(ticket.name.replace("admit-", "holder-"))
         taken = []
         numbers = set()
@@ -1036,9 +1044,9 @@ class Admission:
                         taken.append(slot)
                         numbers.add(number)
                         if len(taken) == weight:
-                            info = json.loads(ticket.read_text())
-                            ticket.write_text(json.dumps(info | {"slots": sorted(numbers)}))
-                            ticket.rename(holder)
+                            ticket.rename(pending)
+                            pending.write_text(json.dumps(info | {"slots": sorted(numbers)}))
+                            pending.rename(holder)
                             taken.append(handle)
                             return True
                 while taken:
@@ -1076,6 +1084,7 @@ class Admission:
             if handle not in taken:
                 handle.close()
             ticket.unlink(missing_ok=True)
+            pending.unlink(missing_ok=True)
             _signal(pool)
 
     @staticmethod
