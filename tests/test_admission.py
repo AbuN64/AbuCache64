@@ -152,3 +152,34 @@ def test_holder_metadata_exposes_the_declared_memory_and_pid(admission):
         assert slots._admission_pids(admission.pool_dir()) == [os.getpid()]
     finally:
         grant.release()
+
+
+def test_real_waiters_grant_in_class_order(admission, monkeypatch):
+    monkeypatch.setattr(admission, "capacity", lambda: 1)
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: {0})
+    first = admission.acquire("batch")
+    queued = {klass: threading.Event() for klass in slots.CLASSES}
+    order = []
+    real_until = slots._until
+
+    def until(directory, attempt, **kwargs):
+        queued[threading.current_thread().name].set()
+        return real_until(directory, attempt, **kwargs)
+
+    monkeypatch.setattr(slots, "_until", until)
+
+    def work(klass):
+        grant = admission.acquire(klass)
+        order.append(klass)
+        grant.release()
+
+    threads = []
+    for klass in reversed(slots.CLASSES):
+        thread = threading.Thread(target=work, args=(klass,), name=klass)
+        threads.append(thread)
+        thread.start()
+        queued[klass].wait()
+    first.release()
+    for thread in threads:
+        thread.join()
+    assert order == list(slots.CLASSES)
