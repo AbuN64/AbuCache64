@@ -1006,7 +1006,7 @@ class Admission:
         handle = _try(ticket)
         if handle is None:
             raise RuntimeError("admission ticket already held")
-        ticket.write_text(json.dumps({"pid": os.getpid(), "label": label, "memory": need}))
+        ticket.write_text(json.dumps({"pid": os.getpid(), "label": label, "memory": need, "klass": klass}))
         holder = ticket.with_name(ticket.name.replace("admit-", "holder-"))
         taken = []
         numbers = set()
@@ -1036,6 +1036,8 @@ class Admission:
                         taken.append(slot)
                         numbers.add(number)
                         if len(taken) == weight:
+                            info = json.loads(ticket.read_text())
+                            ticket.write_text(json.dumps(info | {"slots": sorted(numbers)}))
                             ticket.rename(holder)
                             taken.append(handle)
                             return True
@@ -1116,6 +1118,17 @@ class Admission:
 
         return decorate
 
+    @staticmethod
+    def _holders(pool: Path) -> list[dict]:
+        rows = []
+        for path in sorted(pool.glob("holder-*.lock")):
+            try:
+                if _busy(path):
+                    rows.append(json.loads(path.read_text()))
+            except FileNotFoundError:  # released between listing and reading
+                continue
+        return rows
+
     def status(self) -> dict:
         pool = self.pool_dir()
         return {
@@ -1124,7 +1137,13 @@ class Admission:
             "disk_gib": self.policy.disk_gib,
             "disk_free_gib": self.disk_free_gib(),
             "mem_floor_gib": self.policy.floor_gib,
-            "queue": [p.name for p in self._queue(pool)],
+            "queue": [
+                {"ticket": p.name, **json.loads(p.read_text())}
+                if p.name.startswith("admit-")
+                else {"ticket": p.name, "pid": int(p.name.rsplit("-", 1)[1])}
+                for p in self._queue(pool)
+            ],
+            "holders": self._holders(pool),
             "used": sum(_busy(p) for p in pool.glob("slot-*.lock")),
         }
 

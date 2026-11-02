@@ -148,7 +148,13 @@ def test_declared_values_validate_and_stamp_width_uses_them(admission):
 def test_holder_metadata_exposes_the_declared_memory_and_pid(admission):
     grant = admission.acquire("background", label="work", mem_gib=5)
     try:
-        assert json.loads(grant.holder.read_text()) == {"pid": os.getpid(), "label": "work", "memory": 5}
+        assert json.loads(grant.holder.read_text()) == {
+            "pid": os.getpid(),
+            "label": "work",
+            "memory": 5,
+            "klass": "background",
+            "slots": [0],
+        }
         assert slots._admission_pids(admission.pool_dir()) == [os.getpid()]
     finally:
         grant.release()
@@ -183,3 +189,17 @@ def test_real_waiters_grant_in_class_order(admission, monkeypatch):
     for thread in threads:
         thread.join()
     assert order == list(slots.CLASSES)
+
+
+def test_status_exposes_live_holders_to_consumers(admission):
+    grant = admission.acquire("batch", 2, "build")
+    try:
+        status = admission.status()
+        assert status["used"] == 2
+        assert status["queue"] == []
+        assert status["holders"] == [
+            {"pid": os.getpid(), "klass": "batch", "label": "build", "memory": 1.5, "slots": [0, 1]}
+        ]
+    finally:
+        grant.release()
+    assert admission.status()["holders"] == []
