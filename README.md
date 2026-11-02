@@ -41,3 +41,13 @@ Released under [GNU GPL version 3 or later](LICENSE).
 The tools that use abucache (CakeUnbake64, AbuDecomp64, CakeTaste64, RecipeMaker64 and the game repositories unbake
 generates) run `ci/abucache-audit` in their check entry point: a new cache, slot, pool, executor or timing path outside
 abucache is refused with this package named as its owner.
+
+Class admission uses `abucache.slots.Admission(Policy(...))`, on the same slot
+files as `Slots`. All six Policy fields are caller-declared: `reserve_cores`,
+`floor_gib`, `disk_gib`, `rss_gib`, `stamp_gib`, `stamp_jobs`. `hold(class, weight,
+label, mem_gib=...)` guards work, releases on every exit and pins the calling
+thread and its children to the granted cores. `admitted(class)` guards functions.
+Classes order owner, interactive, batch, background, with FIFO within each class.
+Owner may use reserve cores and bypass resource floors. Other requests refuse
+before work if their declared memory or disk cannot fit. Waits use queue/release
+notifications and holder process exit; no retry duration controls completion.

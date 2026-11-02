@@ -25,7 +25,9 @@ from __future__ import annotations
 import contextlib
 import ctypes
 import fcntl
+import functools
 import io
+import json
 import os
 import re
 import select
@@ -36,6 +38,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 from abucache import runtime as runtime_file
@@ -388,13 +391,18 @@ class Slots:
                 live.append(ticket)
             else:
                 ticket.unlink(missing_ok=True)
-        return live
+        for ticket in pool.glob("admit-*.lock"):
+            if _busy(ticket):
+                live.append(ticket)
+            else:
+                ticket.unlink(missing_ok=True)
+        return sorted(live, key=_ticket_order)
 
     def _queued(self, pool: Path) -> bool:
         """Whether a command that asked before this one still waits for a slot: free slots are its, in arrival order.
         A command takes a free slot ahead of nobody, so the longest waiter is never starved by newer commands."""
         queue = self._queue(pool)
-        return any(t < self.ticket[0] for t in queue) if self.ticket else bool(queue)
+        return any(_ticket_order(t) < _ticket_order(self.ticket[0]) for t in queue) if self.ticket else bool(queue)
 
     def waiting(self) -> bool:
         """Whether another command waits for a host slot now: a ticket in the queue that is not this process's own."""
@@ -443,7 +451,9 @@ class Slots:
         def attempt() -> bool:
             return bool(self._take(pool, self._divide(pool, mine, want)[1], 1))
 
-        _until(pool, attempt, pids=lambda: [_pid(p) for p in self._peers(pool, mine) if p != mine])
+        _until(
+            pool, attempt, pids=lambda: [_pid(p) for p in self._peers(pool, mine) if p != mine] + _admission_pids(pool)
+        )
 
     def acquire(self, active: int = 0, cap: int = 0, task_memory: int = 0) -> None:
         """All processes of this user share the host slots (flock files): a command takes its share of the free ones
@@ -717,7 +727,7 @@ class Slots:
         _until(
             pool,
             attempt,
-            pids=lambda: [_pid(p) for p in self._peers(pool, mine) if p != mine],
+            pids=lambda: [_pid(p) for p in self._peers(pool, mine) if p != mine] + _admission_pids(pool),
             stop=stop,
             also=lambda: spare if over[0] else None,
             interval=REBALANCE,
@@ -819,9 +829,7 @@ def run(argv: Sequence[str]) -> int:
     try:
         runtime_file.load()
     except runtime_file.RuntimeConfigError:  # no usable runtime file: run the command alone, holding no slots
-        return subprocess.run(
-            [a.replace("{j}", "1") for a in command], env={**os.environ, CORES_ENV: "1"}
-        ).returncode
+        return subprocess.run([a.replace("{j}", "1") for a in command], env={**os.environ, CORES_ENV: "1"}).returncode
     with contextlib.ExitStack() as stack:
         extra = {}
         if named:
@@ -846,6 +854,279 @@ def run(argv: Sequence[str]) -> int:
 
 def main() -> int:
     return run(sys.argv[1:])
+
+
+CLASSES = ("owner", "interactive", "batch", "background")
+
+
+def _ticket_order(ticket: Path) -> tuple[int, int, str]:
+    parts = ticket.stem.split("-")
+    if parts[0] == "admit":
+        return int(parts[1]), int(parts[2]), ticket.name
+    # Native priority work ranks as owner, ordinary work as batch.
+    return (0 if parts[1][0] == "0" else 2), int(parts[1][1:]), ticket.name
+
+
+def _admission_pids(pool: Path) -> list[int]:
+    result = []
+    for path in pool.glob("holder-*.lock"):
+        try:
+            if _busy(path):
+                result.append(json.loads(path.read_text())["pid"])
+            else:
+                path.unlink(missing_ok=True)
+        except FileNotFoundError:
+            continue
+    return result
+
+
+class AdmissionError(RuntimeError):
+    """A declared resource constraint cannot be satisfied before starting work."""
+
+    def __init__(self, key: str, detail: str, hint: str = "") -> None:
+        self.key, self.detail, self.hint = key, detail, hint
+        super().__init__(f"{key}: {detail}")
+
+    def finding(self) -> dict:
+        return {"key": self.key, "message": self.detail, "hint": self.hint, "blocking": True}
+
+
+@dataclass
+class Policy:
+    """Caller-owned resource values, in GiB and cores; no product policy lives in the pool."""
+
+    reserve_cores: float
+    floor_gib: float
+    disk_gib: float
+    rss_gib: float
+    stamp_gib: float
+    stamp_jobs: int
+
+    def __post_init__(self) -> None:
+        if any(value < 0 for value in vars(self).values()) or self.rss_gib <= 0:
+            raise ValueError("admission values must be nonnegative and rss_gib positive")
+
+
+@dataclass
+class Grant:
+    weight: int
+    numbers: set[int]
+    waited: float
+    handles: list
+    holder: Path
+
+    def release(self) -> None:
+        while self.handles:
+            _give(self.handles.pop())
+        self.holder.unlink(missing_ok=True)
+        _signal(self.holder.parent)
+
+
+class Admission:
+    """Class FIFO admission on the SAME slot files as Slots and its make jobserver.
+
+    Values are explicit Policy data. Releases, queue changes and holder death wake
+    waiters; no timer retries admission. Resource refusal precedes queueing.
+    """
+
+    def __init__(self, policy: Policy) -> None:
+        self.policy = policy
+        self._local = threading.local()
+        self.CANCEL = None
+
+    def configure(self, section: dict | None) -> None:
+        values = vars(self.policy) | (section or {})
+        self.policy = Policy(**values)
+
+    def pool_dir(self) -> Path:
+        return _pool(_runtime_base())
+
+    @staticmethod
+    def _mem_gib(field: str) -> float:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith(field + ":"):
+                return int(line.split()[1]) / 1048576
+        raise AdmissionError("slots.memory", f"missing {field}")
+
+    def disk_free_gib(self) -> float:
+        usage = os.statvfs(self.pool_dir())
+        return usage.f_bavail * usage.f_frsize / 2**30
+
+    def capacity(self) -> int:
+        return max(
+            1,
+            min(
+                int(len(os.sched_getaffinity(0)) - self.policy.reserve_cores),
+                int((self._mem_gib("MemTotal") - self.policy.floor_gib) / self.policy.rss_gib),
+            ),
+        )
+
+    def stamp_slots(self) -> int:
+        cap = self.capacity()
+        return max(
+            1,
+            min(
+                cap // self.policy.stamp_jobs if self.policy.stamp_jobs else cap,
+                int((self._mem_gib("MemTotal") - self.policy.floor_gib) / self.policy.stamp_gib)
+                if self.policy.stamp_gib
+                else cap,
+            ),
+        )
+
+    def stamp_weight(self, klass: str = "batch") -> int:
+        return self.capacity() if klass in CLASSES[:2] else max(1, self.capacity() // self.stamp_slots())
+
+    def check_disk(self, klass: str, weight: int) -> None:
+        need = self.policy.disk_gib * weight
+        free = self.disk_free_gib()
+        if klass != "owner" and free < need:
+            raise AdmissionError(
+                "slots.disk_floor",
+                f"{free:.1f} GiB free; {weight} slots need {need:.1f} GiB; refused before work to prevent ENOSPC",
+                "free disk or correct caller policy",
+            )
+
+    _queue = staticmethod(Slots._queue)
+
+    def acquire(self, klass: str, weight: int = 1, label: str = "", *, mem_gib: float | None = None) -> Grant:
+        if klass not in CLASSES or weight < 1:
+            raise ValueError("known class and positive slot weight required")
+        pool = self.pool_dir()
+        limit = len(os.sched_getaffinity(0)) if klass == "owner" else self.capacity()
+        if weight > limit:
+            raise AdmissionError("slots.capacity", f"{weight} slots exceed capacity {limit}")
+        self.check_disk(klass, weight)
+        need = mem_gib if mem_gib is not None else weight * self.policy.rss_gib
+        if need < 0:
+            raise ValueError("memory need must be nonnegative")
+        if klass != "owner" and self._mem_gib("MemAvailable") < self.policy.floor_gib + need:
+            raise AdmissionError("slots.memory", f"need {need} GiB above floor {self.policy.floor_gib} GiB")
+        began = time.monotonic()
+        ticket = pool / f"admit-{CLASSES.index(klass)}-{time.time_ns():020d}-{os.getpid()}-{threading.get_ident()}.lock"
+        handle = _try(ticket)
+        if handle is None:
+            raise RuntimeError("admission ticket already held")
+        ticket.write_text(json.dumps({"pid": os.getpid(), "label": label, "memory": need}))
+        holder = ticket.with_name(ticket.name.replace("admit-", "holder-"))
+        taken = []
+        numbers = set()
+
+        def attempt() -> bool:
+            if self.CANCEL:
+                self.CANCEL()
+            if self._queue(pool)[0] != ticket:
+                return False
+            # Serialize the whole weighted claim against other class consumers.
+            guard = _try(pool / "admission.lock")
+            if guard is None:
+                return False
+            try:
+                if self._queue(pool)[0] != ticket:
+                    return False
+                self.check_disk(klass, weight)
+                promised = 0.0
+                for path in pool.glob("holder-*.lock"):
+                    if _busy(path):
+                        promised += json.loads(path.read_text())["memory"]
+                if klass != "owner" and self._mem_gib("MemAvailable") < self.policy.floor_gib + need + promised:
+                    raise AdmissionError("slots.memory", "available memory cannot cover the floor and reserved work")
+                for number in range(limit):
+                    slot = _try(pool / f"slot-{number}.lock")
+                    if slot is not None:
+                        taken.append(slot)
+                        numbers.add(number)
+                        if len(taken) == weight:
+                            ticket.rename(holder)
+                            taken.append(handle)
+                            return True
+                while taken:
+                    taken.pop().close()
+                numbers.clear()
+                return False
+            finally:
+                guard.close()
+
+        def holders() -> list[int]:
+            paths = [*pool.glob("cmd-*.lock"), *pool.glob("admit-*.lock"), *pool.glob("holder-*.lock")]
+            pids = []
+            for path in paths:
+                try:
+                    pid = (
+                        int(path.stem.split("-")[-1])
+                        if path.name.startswith("cmd-")
+                        else json.loads(path.read_text())["pid"]
+                    )
+                    if pid != os.getpid():
+                        pids.append(pid)
+                except (FileNotFoundError, ValueError, KeyError):
+                    continue
+            return pids
+
+        try:
+            _until(pool, attempt, pids=holders)
+            return Grant(weight, numbers, time.monotonic() - began, taken, holder)
+        except BaseException:
+            while taken:
+                _give(taken.pop())
+            holder.unlink(missing_ok=True)
+            raise
+        finally:
+            if handle not in taken:
+                handle.close()
+            ticket.unlink(missing_ok=True)
+            _signal(pool)
+
+    @staticmethod
+    def _cores_for(numbers: set[int], allowed: set[int]) -> set[int]:
+        ordered = sorted(allowed)
+        return {ordered[n % len(ordered)] for n in numbers}
+
+    def _pin(self, numbers: set[int]) -> set[int]:
+        before = os.sched_getaffinity(0)
+        os.sched_setaffinity(0, self._cores_for(numbers, before))
+        return before
+
+    @contextmanager
+    def hold(self, klass: str = "batch", weight: int = 1, label: str = "", *, mem_gib: float | None = None):
+        if getattr(self._local, "depth", 0) or os.environ.get(CORES_ENV):
+            yield None
+            return
+        grant = self.acquire(klass, weight, label, mem_gib=mem_gib)
+        before = None
+        self._local.depth = 1
+        try:
+            before = self._pin(grant.numbers)
+            yield grant
+        finally:
+            self._local.depth = 0
+            try:
+                if before is not None:
+                    os.sched_setaffinity(0, before)
+            finally:
+                grant.release()
+
+    def admitted(self, klass: str, weight: int = 1):
+        def decorate(fn):
+            @functools.wraps(fn)
+            def wrapped(*args, **kwargs):
+                with self.hold(klass, weight, fn.__name__):
+                    return fn(*args, **kwargs)
+
+            return wrapped
+
+        return decorate
+
+    def status(self) -> dict:
+        pool = self.pool_dir()
+        return {
+            "capacity": self.capacity(),
+            "stamp_slots": self.stamp_slots(),
+            "disk_gib": self.policy.disk_gib,
+            "disk_free_gib": self.disk_free_gib(),
+            "mem_floor_gib": self.policy.floor_gib,
+            "queue": [p.name for p in self._queue(pool)],
+            "used": sum(_busy(p) for p in pool.glob("slot-*.lock")),
+        }
 
 
 if __name__ == "__main__":
