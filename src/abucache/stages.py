@@ -263,6 +263,9 @@ class _Open:
         self.children: list[StageRecord] = []
         self.remote_cache: dict[str, tuple[int, int]] = {}
 
+    wall: float | None = None  # set once, when the span closes: the wall seconds its record carries
+    status = "running"  # becomes the record's status when the span closes
+
     def add(self, *, items: int = 0, findings: Sequence[Any] = ()) -> None:
         self.items += items
         self.findings.extend(finding_to_dict(f) for f in findings)
@@ -482,7 +485,8 @@ def _emit(record: StageRecord, leaf: bool = False, shipped: bool = False) -> Sta
 def _close(opened: _Open, status: str) -> StageRecord:
     end = time.perf_counter_ns()
     children = opened.children
-    wall = max(0, end - opened.start) / 1e9
+    wall = opened.wall = max(0, end - opened.start) / 1e9
+    opened.status = status
     parent = max(0, _cpu() - opened.cpu)
     own_cpu = max(0, parent - sum(c.parent_cpu_seconds for c in children))
     cache = {
@@ -537,6 +541,13 @@ def _blame(exc: BaseException) -> str:
     return f" at {Path(frames[-1].filename).stem}:{frames[-1].name}:{frames[-1].lineno}" if frames else ""
 
 
+def _status(exc: BaseException) -> str:
+    """The record status an exception leaving a span gives it."""
+    if isinstance(exc, _refusals):
+        return "refused"
+    return "interrupted" if isinstance(exc, KeyboardInterrupt) else "failed"
+
+
 @contextmanager
 def _scope(opened: _Open) -> Iterator[_Open]:
     token = _stack.set((*_stack.get(), opened))
@@ -548,7 +559,7 @@ def _scope(opened: _Open) -> Iterator[_Open]:
         yield opened
     except BaseException as exc:
         refused = isinstance(exc, _refusals)
-        status = "refused" if refused else "interrupted" if isinstance(exc, KeyboardInterrupt) else "failed"
+        status = _status(exc)
         if refused:
             opened.findings.extend(finding_to_dict(f) for f in getattr(exc, "findings", ()))
         elif status == "failed" and not vars(exc).get("_named", False):  # the stage that raised names the cause once
@@ -647,6 +658,64 @@ def stage(name: str) -> Iterator[Any]:
     else:
         with _scope(_Open(name, "stage", _stack.get()[-1])) as span:
             yield span
+
+
+class Timing:
+    """The duration of one `timed` block, read by the caller as `seconds` and nothing else.
+
+    While the block runs, `seconds` is the monotonic time since it opened; once it has left (by returning or by an
+    exception) `seconds` is final and `status` is the record status ("ok", "refused", "failed" or "interrupted").
+    `recorded` says who owns the block: True when it ran inside a `command` of this context, so it is also a stage
+    of that command's log and tree; False when no command is open in the calling context (a thread, or code outside
+    any command), where it is only measured. Every `timed` block has its own Timing, so threads and sessions never
+    share one."""
+
+    def __init__(self, opened: _Open, recorded: bool):
+        self._opened, self.recorded = opened, recorded
+
+    @property
+    def name(self) -> str:
+        return self._opened.path[-1]
+
+    @property
+    def running(self) -> bool:
+        return self._opened.wall is None
+
+    @property
+    def seconds(self) -> float:
+        wall = self._opened.wall
+        return max(0, time.perf_counter_ns() - self._opened.start) / 1e9 if wall is None else wall
+
+    @property
+    def status(self) -> str:
+        """"running" until the block has left."""
+        return self._opened.status
+
+
+@contextmanager
+def timed(name: str) -> Iterator[Timing]:
+    """A block whose duration the caller reads from the yielded `Timing`, running or finished.
+
+    Inside a `command` of the calling context it is the same stage `stage(name)` opens (same log row, tree and
+    events) and `Timing.seconds` equals that row's wall. Outside one it is measured but not recorded, so a thread
+    that did not inherit the command's context times its own work without touching the command's log. An exception
+    leaves the block finished with its status and propagates unchanged."""
+    stack = _stack.get()
+    opened = _Open(name, "stage", stack[-1] if stack else None)
+    timing = Timing(opened, recorded=bool(stack))
+    status = "ok"
+    try:
+        if stack:
+            with _scope(opened):
+                yield timing
+        else:
+            yield timing
+    except BaseException as exc:
+        status = _status(exc)
+        raise
+    finally:
+        if opened.wall is None:  # not recorded, or its recording failed before the span closed
+            opened.wall, opened.status = max(0, time.perf_counter_ns() - opened.start) / 1e9, status
 
 
 def record_native(name: str, completed: Any, start_ns: int) -> None:

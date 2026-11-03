@@ -604,3 +604,111 @@ def test_a_span_tree_equals_the_one_unbake_wrote_for_the_same_work(sink, monkeyp
 
     strip(ours)
     assert ours == golden
+
+
+class Clock:
+    """A hand-driven monotonic clock for `stages.time`: the tests move it, never wait."""
+
+    def __init__(self):
+        self.now = 1_000_000
+
+    def perf_counter_ns(self):
+        return self.now
+
+    @staticmethod
+    def time():
+        return 0.0
+
+    def advance(self, seconds):
+        self.now += int(seconds * 1e9)
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    fake = Clock()
+    monkeypatch.setattr(stages, "time", fake)
+    return fake
+
+
+def test_timed_reads_seconds_while_open_and_after_close(sink, clock):
+    with run(sink):
+        with stages.timed("work") as timing:
+            assert timing.running and timing.status == "running" and timing.recorded
+            assert timing.seconds == 0.0
+            clock.advance(1.5)
+            assert timing.seconds == 1.5
+            clock.advance(0.5)
+        assert not timing.running and timing.status == "ok" and timing.name == "work"
+        clock.advance(10)  # a finished timing stays final
+        assert timing.seconds == 2.0
+    row = next(r for r in stages.closed() if r.path == ("check", "work"))
+    assert row.wall_seconds == timing.seconds and row.kind == "stage"
+
+
+def test_timed_keeps_the_stage_contract(sink):
+    with run(sink), stages.timed("a"), stages.stage("b"):
+        pass
+    assert [r.path for r in stages.closed() if r.kind == "stage"] == [("check", "a", "b"), ("check", "a")]
+
+
+def test_timed_failure_propagates_and_finishes(sink, clock):
+    seen = []
+    with pytest.raises(ValueError, match="boom"), run(sink), stages.timed("bad") as timing:
+        seen.append(timing)
+        clock.advance(3)
+        raise ValueError("boom")
+    assert not timing.running and timing.seconds == 3.0 and timing.status == "failed"
+    assert next(r for r in stages.closed() if r.path == ("check", "bad")).status == "failed"
+
+
+def test_timed_refusal_and_interrupt_statuses(sink):
+    with pytest.raises(Refusal), run(sink), stages.timed("r") as refused:
+        raise Refusal()
+    assert refused.status == "refused"
+    with pytest.raises(KeyboardInterrupt), run(sink), stages.timed("i") as interrupted:
+        raise KeyboardInterrupt
+    assert interrupted.status == "interrupted"
+
+
+def test_timed_outside_a_command_measures_without_recording(clock):
+    before = stages.closed()
+    with stages.timed("loose") as timing:
+        clock.advance(2)
+        assert timing.seconds == 2.0 and not timing.recorded
+    assert timing.status == "ok" and timing.seconds == 2.0
+    with pytest.raises(RuntimeError), stages.timed("loose-bad") as bad:
+        clock.advance(1)
+        raise RuntimeError("x")
+    assert bad.status == "failed" and bad.seconds == 1.0
+    assert stages.closed() == before
+
+
+def test_timed_threads_own_their_timing(sink, clock):
+    import threading
+
+    box = {}
+
+    def work():
+        with stages.timed("thread") as timing:
+            box["timing"] = timing
+            clock.advance(4)
+
+    with run(sink), stages.timed("main") as main:
+        thread = threading.Thread(target=work)
+        thread.start()
+        thread.join()
+        clock.advance(1)
+    assert not box["timing"].recorded and box["timing"].seconds == 4.0
+    assert main.recorded and main.seconds == 5.0
+    assert [r.path for r in stages.closed() if r.kind == "stage"] == [("check", "main")]
+
+
+def test_timed_sessions_are_independent(sink, clock):
+    with run(sink, "first"), stages.timed("work") as first:
+        clock.advance(1)
+    with run(sink, "second"), stages.timed("work") as second:
+        clock.advance(2)
+    assert (first.seconds, second.seconds) == (1.0, 2.0)
+    with stages.timed("a") as a, stages.timed("b") as b:  # nested loose timings do not share a clock reading
+        clock.advance(1)
+    assert (a.seconds, b.seconds) == (1.0, 1.0)
