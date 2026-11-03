@@ -31,6 +31,7 @@ import json
 import os
 import re
 import select
+import stat
 import subprocess
 import sys
 import termios
@@ -852,7 +853,101 @@ def run(argv: Sequence[str]) -> int:
     return child.returncode
 
 
+def run_make(argv: Sequence[str]) -> int:
+    """Run make under a positive slot grant, retaining inherited jobservers and holding admission until exit.
+
+    Unlike the general command runner, missing runtime configuration refuses before starting make.
+    JOBS and a raw -j option never grant slots.
+    """
+    if not argv or not _is_make(argv[0]):
+        raise ValueError("a make command is required")
+    if any(a.startswith(("-j", "--jobs")) or re.fullmatch(r"-[A-Za-z]*j[0-9]*", a) for a in argv[1:]):
+        raise ValueError("make width comes from slot admission, not command arguments")
+    argv = [*argv, "_ABUCACHE_ADMITTED=1"]
+    flags = os.environ.get("MAKEFLAGS", "")
+    inherited = os.environ.get(CORES_ENV)
+    if inherited is not None and (not inherited.isdecimal() or int(inherited) < 1):
+        raise ValueError(f"{CORES_ENV} must be a positive admitted width")
+    auth = re.search(r"(?:^|\s)--jobserver-(?:auth|fds)=([^\s]+)", flags)
+    fds: tuple[int, ...] = ()
+    if auth:
+        value = auth[1]
+        if value.startswith("fifo:"):
+            if not stat.S_ISFIFO(os.stat(value[5:]).st_mode):
+                raise ValueError("inherited jobserver is not a FIFO")
+        else:
+            fds = tuple(int(n) for n in value.split(","))
+            if len(fds) != 2:
+                raise ValueError("inherited jobserver needs two descriptors")
+            for fd in fds:
+                if not stat.S_ISFIFO(os.fstat(fd).st_mode):
+                    raise ValueError("inherited jobserver descriptors must name a pipe")
+        return subprocess.run(argv, env={**os.environ, CORES_ENV: inherited or "1"}, pass_fds=fds).returncode
+    # Drop any unadmitted -j, including a bare unlimited -j. Retain other make options and variable assignments.
+    flags = re.sub(r"(?:^|\s)(?:-j(?:\s*\d+)?|--jobs(?:[= ]\d+)?)(?=\s|$)", "", flags)
+    options, separator, overrides = flags.partition(" -- ")
+    if inherited is not None:
+        return subprocess.run(
+            argv, env={**os.environ, "MAKEFLAGS": f"{options} -j{inherited}{separator}{overrides}"}
+        ).returncode
+    configure(runtime_file.load())
+    with jobserver() as (width, env, fds):
+        if width < 1:
+            raise ValueError("slot admission must grant a positive width")
+        return subprocess.run(
+            argv,
+            env={**os.environ, **env, "MAKEFLAGS": f"{options} {env['MAKEFLAGS']}{separator}{overrides}"},
+            pass_fds=fds,
+        ).returncode
+
+
+def _parent_make(pid: int) -> list[str]:
+    """Retain make's original options (MAKEFLAGS omits -o/-W/-f/-C), after its directory changes.
+
+    The delegating make has already applied -C; width always comes from admission instead of its raw -j.
+    """
+    args = [os.fsdecode(a) for a in Path(f"/proc/{pid}/cmdline").read_bytes().rstrip(b"\0").split(b"\0")]
+    if not args or not _is_make(args[0]):
+        raise ValueError("admission parent must be make")
+    return [args[0], *_parent_options(args[1:])]
+
+
+def _parent_options(args: list[str]) -> list[str]:
+    """Normalize the remaining parent options through the same pass."""
+    # Kept separate from reading /proc so arguments are parsed once, without another process lookup.
+    result: list[str] = []
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        i += 1
+        if arg == "--":
+            return [*result, arg, *args[i:]]
+        if arg in ("-C", "--directory"):
+            i += 1
+        elif arg in ("-j", "--jobs"):
+            if i < len(args) and args[i].isdigit():
+                i += 1
+        elif arg.startswith(("-C", "--directory=", "--jobs=")):
+            continue
+        elif match := re.fullmatch(r"(-[A-Za-z]*)j[0-9]*", arg):
+            if match[1] != "-":
+                result.append(match[1])
+        else:
+            result.append(arg)
+    return result
+
+
 def main() -> int:
+    if sys.argv[1:2] in (["--make"], ["--make-parent"]):
+        try:
+            if sys.argv[1] == "--make-parent":
+                if len(sys.argv) != 3:
+                    raise ValueError("--make-parent requires one parent PID")
+                return run_make(_parent_make(int(sys.argv[2])))
+            return run_make(sys.argv[2:])
+        except (runtime_file.RuntimeConfigError, ValueError, OSError) as exc:
+            print(f"make admission refused: {exc}", file=sys.stderr)
+            return 2
     return run(sys.argv[1:])
 
 

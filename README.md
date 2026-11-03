@@ -51,3 +51,12 @@ Classes order owner, interactive, batch, background, with FIFO within each class
 Owner may use reserve cores and bypass resource floors. Other requests refuse
 before work if their declared memory or disk cannot fit. Waits use queue/release
 notifications and holder process exit; no retry duration controls completion.
+
+`python -m abucache.slots --make make <targets...>` (or `slots.run_make`) admits a generated make invocation.
+It requires a valid runtime for fresh admission, preserves a live inherited pipe/FIFO jobserver, and holds its
+positive grant until the child exits. `JOBS` and raw make width flags do not grant slots. Closed jobserver descriptors
+and invalid inherited widths refuse rather than silently creating another parallel build.
+
+Generated make uses `--make-parent <pid>` to retain its original argument list, including options GNU make omits
+from MAKEFLAGS. Directory changes are already applied; unadmitted width flags are removed. The generated delegate
+preserves MAKELEVEL so existing top-level maintenance and recursive build behavior keep their meaning.
