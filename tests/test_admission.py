@@ -5,6 +5,8 @@
 import json
 import os
 import threading
+from dataclasses import replace
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -165,11 +167,13 @@ def test_real_waiters_grant_in_class_order(admission, monkeypatch):
     monkeypatch.setattr(os, "sched_getaffinity", lambda pid: {0})
     first = admission.acquire("batch")
     queued = {klass: threading.Event() for klass in slots.CLASSES}
+    start = threading.Event()
     order = []
     real_until = slots._until
 
     def until(directory, attempt, **kwargs):
         queued[threading.current_thread().name].set()
+        start.wait()  # all tickets are published before any waiter takes a queue snapshot
         return real_until(directory, attempt, **kwargs)
 
     monkeypatch.setattr(slots, "_until", until)
@@ -186,6 +190,7 @@ def test_real_waiters_grant_in_class_order(admission, monkeypatch):
         thread.start()
         queued[klass].wait()
     first.release()
+    start.set()
     for thread in threads:
         thread.join()
     assert order == list(slots.CLASSES)
@@ -226,3 +231,73 @@ def test_ticket_publication_cannot_be_deleted_by_a_competing_census(admission, m
         assert admission.status()["holders"][0]["slots"] == [0]
     finally:
         grant.release()
+
+
+@pytest.mark.parametrize(
+    ("weight", "free_gib", "accepted"),
+    [(1, 4.7, False), (1, 40, True), (1, 70, True), (2, 70, False), (2, 80, True)],
+)
+def test_disk_floor_counts_only_requested_slots(admission, monkeypatch, weight, free_gib, accepted):
+    """The 09XN host had 4.7 GiB free and a 40 GiB floor per requested slot."""
+    free_bytes = int(free_gib * 2**30)
+    monkeypatch.setattr(admission, "disk_free_gib", lambda: free_bytes / 2**30)
+    if accepted:
+        grant = admission.acquire("batch", weight)
+        try:
+            assert grant.weight == weight
+            assert len(grant.numbers) == weight
+        finally:
+            grant.release()
+    else:
+        with pytest.raises(slots.AdmissionError) as caught:
+            admission.acquire("batch", weight)
+        assert caught.value.key == "slots.disk_floor"
+        assert f"root={admission.pool_dir()}" in caught.value.detail
+        assert f"free={free_bytes} bytes" in caught.value.detail
+        assert f"needed={40 * weight * 2**30} bytes for {weight} slots" in caught.value.detail
+        assert not list(admission.pool_dir().glob("admit-*"))
+        assert not list(admission.pool_dir().glob("holder-*"))
+        assert not list(admission.pool_dir().glob("slot-*"))
+
+
+def test_admission_measures_declared_storage_not_runtime_tmpfs(rundir, make_runtime, monkeypatch, tmp_path):
+    runtime = make_runtime()
+    admission = slots.Admission(slots.Policy(0, 4, 40, 0.75, 5, 2), runtime=runtime)
+    transient = tmp_path / "runtime-tmpfs"
+    transient.mkdir()
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(transient))
+    measured = []
+
+    def statvfs(path):
+        measured.append(path)
+        # The configured storage fits one slot; the runtime tmpfs does not.
+        return SimpleNamespace(
+            f_bavail=40 * 2**30 if path.is_relative_to(rundir) else int(4.7 * 2**30), f_frsize=1,
+        )
+
+    monkeypatch.setattr(os, "statvfs", statvfs)
+    admission.check_disk("batch", 1)
+    assert measured == [rundir / slots.POOL]
+    assert not list(transient.iterdir())
+    monkeypatch.delenv("XDG_RUNTIME_DIR")
+    assert admission.pool_dir() == rundir / slots.POOL
+    assert slots.wait_log().parent == admission.pool_dir()
+
+
+def test_missing_storage_declaration_does_not_fall_back_to_runtime_tmpfs(rundir, monkeypatch, tmp_path):
+    monkeypatch.setattr(slots, "default", slots.Slots())
+    monkeypatch.setenv("ABU_RUNTIME", str(tmp_path / "missing.toml"))
+    admission = slots.Admission(slots.Policy(0, 4, 40, 0.75, 5, 2))
+    with pytest.raises(slots.runtime_file.RuntimeConfigError):
+        admission.acquire("batch")
+    assert not list((tmp_path / "run").iterdir())
+
+
+def test_relative_storage_root_is_refused(make_runtime):
+    runtime = make_runtime()
+    admission = slots.Admission(
+        slots.Policy(0, 4, 40, 0.75, 5, 2),
+        runtime=replace(runtime, cache_dir=runtime.cache_dir.relative_to(runtime.cache_dir.parent)),
+    )
+    with pytest.raises(ValueError, match="absolute storage path"):
+        admission.pool_dir()

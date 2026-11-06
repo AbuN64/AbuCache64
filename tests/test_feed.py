@@ -45,12 +45,13 @@ def _fresh(monkeypatch, tmp_path):
 @pytest.fixture
 def host(tmp_path, monkeypatch, make_runtime):
     """A runtime file named by ABU_RUNTIME (feed beside it, slow after 60 s) and a runtime directory."""
-    make_runtime(slow=60)
+    runtime = make_runtime(slow=60)
     monkeypatch.setenv("ABU_RUNTIME", str(tmp_path / "runtime.toml"))
     run = tmp_path / "run"
-    run.mkdir()
+    run.mkdir(exist_ok=True)
     monkeypatch.setenv("XDG_RUNTIME_DIR", str(run))
-    return SimpleNamespace(feed=tmp_path / "feed.jsonl", sink=tmp_path / "state" / "stages.jsonl", run=run)
+    return SimpleNamespace(feed=tmp_path / "feed.jsonl", sink=tmp_path / "state" / "stages.jsonl",
+                           storage=runtime.cache_dir)
 
 
 def lines(path: Path) -> list[dict]:
@@ -117,7 +118,7 @@ def test_a_wait_of_a_minute_reaches_the_slot_directorys_wait_log_with_no_configu
     with stages.command("tool", "check", [], host.sink):
         stages.waited(61, "slots", "held by pids 9")
         stages.waited(5, "slots", "short")
-    rows = lines(host.run / slots.POOL / slots.WAITS)
+    rows = lines(host.storage / slots.POOL / slots.WAITS)
     assert [(r["what"], r["seconds"], r["detail"]) for r in rows] == [("slots", 61.0, "held by pids 9")]
 
 
@@ -126,7 +127,7 @@ def test_an_explicit_wait_log_wins(host, tmp_path):
     stages.configure(wait_log=other)
     with stages.command("tool", "check", [], host.sink):
         stages.waited(61, "lock", "")
-    assert len(lines(other)) == 1 and not (host.run / slots.POOL).exists()
+    assert len(lines(other)) == 1 and not (host.storage / slots.POOL).exists()
 
 
 def test_the_watchdog_announces_a_span_still_running_once(monkeypatch, tmp_path):

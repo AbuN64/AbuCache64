@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 mo
-"""Fixtures for the slot tests: a runtime directory of their own and a runtime file made from a few numbers."""
+"""Fixtures for the slot tests: declared storage of their own and a runtime file made from a few numbers."""
 
 from __future__ import annotations
 
@@ -39,17 +39,26 @@ overrun_percent = 150
 
 @pytest.fixture
 def rundir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """A runtime directory of this test alone, with no cores or capacity handed down by a holder above it."""
-    directory = tmp_path / "run"
+    """Declared storage of this test alone, with no cores or capacity inherited from a holder."""
+    directory = tmp_path / "storage"
     directory.mkdir()
-    monkeypatch.setenv("XDG_RUNTIME_DIR", str(directory))
+    transient = tmp_path / "run"
+    transient.mkdir()
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(transient))
+    path = tmp_path / "runtime.toml"
+    path.write_text(
+        TEXT.format(cores=8, workers=4, reserve=0, capacities="", cache=directory,
+                    feed=tmp_path / "feed.jsonl", slow=60)
+    )
+    monkeypatch.setenv("ABU_RUNTIME", str(path))
+    monkeypatch.setattr(slots, "default", slots.Slots(runtime.load(path)))
     monkeypatch.delenv(slots.CORES_ENV, raising=False)
     monkeypatch.delenv(slots.CAPACITIES_ENV, raising=False)
     return directory
 
 
 @pytest.fixture
-def make_runtime(tmp_path: Path) -> Callable[..., runtime.Runtime]:
+def make_runtime(tmp_path: Path, rundir: Path) -> Callable[..., runtime.Runtime]:
     def make(
         workers: int = 4, capacities: dict[str, int] | None = None, reserve: int = 0, slow: int = 60
     ) -> runtime.Runtime:
@@ -61,7 +70,7 @@ def make_runtime(tmp_path: Path) -> Callable[..., runtime.Runtime]:
                 workers=workers,
                 reserve=reserve,
                 capacities=lines,
-                cache=tmp_path / "cache",
+                cache=rundir,
                 feed=tmp_path / "feed.jsonl",
                 slow=slow,
             )

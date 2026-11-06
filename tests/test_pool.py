@@ -592,7 +592,7 @@ def test_slots_are_released_between_gathers_and_the_executor_stays():
         assert slots.default.slots == [] and slots.default.users == 0
         assert pool._executor is not None
         pool.map("units", _square, [4, 5, 6])
-    assert not list((Path(os.environ["XDG_RUNTIME_DIR"]) / slots.POOL).glob("cmd-*.lock"))
+    assert not list((slots.default.runtime.cache_dir / slots.POOL).glob("cmd-*.lock"))
 
 
 def test_slots_are_released_after_the_executor_is_dropped():

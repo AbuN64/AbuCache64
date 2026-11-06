@@ -3,7 +3,7 @@
 """The host's worker slots: every heavy thing on a machine takes its share of the cores from one set of flock files,
 so commands of any tool divide the machine fairly instead of each assuming it owns it.
 
-Wire protocol 2 (frozen): `$XDG_RUNTIME_DIR/unbake-pool-2/` holds `slot-<n>.lock` (one flock per core),
+Wire protocol 2 (frozen): `<runtime.cache.dir>/unbake-pool-2/` holds `slot-<n>.lock` (one flock per core),
 `slot-express.lock` (one slot beyond the budget, for a command with at most `EXPRESS_AT` chunks), `cmd-<pid>.lock` (a
 live command, holding its demand, its budget and a trailing `p` for the priority job), `wait-<rank><ns>-<pid>` (the
 queue for a free slot; rank 0 is the priority job's, 1 everyone else's), `wake` (the one file whose write-close wakes
@@ -46,7 +46,7 @@ from abucache import runtime as runtime_file
 from abucache import stages
 
 PROTOCOL = 2  # the host slot protocol: a command of any other one books other files, so it never runs beside this one
-POOL = f"unbake-pool-{PROTOCOL}"  # the slot directory of this protocol, under XDG_RUNTIME_DIR
+POOL = f"unbake-pool-{PROTOCOL}"  # the slot directory of this protocol, under the declared runtime cache directory
 WAITS = "waits.jsonl"  # in the slot directory: one line per wait of 60 s or more (stages.WAIT_NOTE), whoever waited
 CORES_ENV = "UNBAKE_CORES"  # the cores a holder above this process took for the command
 CAPACITIES_ENV = "ABU_CAPACITIES"  # comma separated capacity names a holder above this process holds for the command
@@ -167,16 +167,18 @@ def _pool(base: Path) -> Path:
     return pool
 
 
-def _runtime_base() -> Path:
-    base = Path(os.environ.get("XDG_RUNTIME_DIR", ""))
-    if not base.is_dir():
-        raise RuntimeError(f"XDG_RUNTIME_DIR is not a directory ({base}): the worker slots live there")
+def _storage_base(runtime: runtime_file.Runtime) -> Path:
+    """The host's declared work storage; never the runtime tmpfs or the working directory."""
+    base = runtime.cache_dir
+    if not base.is_absolute():
+        raise ValueError(f"runtime.cache.dir must be an absolute storage path: {base}")
+    base.mkdir(parents=True, exist_ok=True)
     return base
 
 
 def wait_log() -> Path:
-    """The host's wait log: pass it to `stages.configure(wait_log=...)` so a wait of a minute or more is noted there."""
-    return Path(os.environ.get("XDG_RUNTIME_DIR", "")) / POOL / WAITS
+    """The host's wait log in its declared storage, alongside the shared slot files."""
+    return _storage_base(default.runtime) / POOL / WAITS
 
 
 def _declared(path: Path, want: int) -> tuple[int, int, bool]:
@@ -467,7 +469,7 @@ class Slots:
             self.slots[:] = [Path(os.devnull).open() for _ in range(min(self.share, cap or self.share))]  # noqa: SIM115
             return
         if not self.cmd or not self.dir:
-            self.dir[:] = [_pool(_runtime_base())]
+            self.dir[:] = [_pool(_storage_base(self.runtime))]
         pool, self.want = self.dir[0], want
         mine = self._register(pool)
         limit = min([n for n in (cap, self._memory_slots()) if n], default=0)  # what this command can use now
@@ -579,7 +581,7 @@ class Slots:
             size = self.runtime.capacities[name]
         except KeyError:
             raise UnknownCapacity(name) from None
-        directory = _pool(_runtime_base()) / f"cap-{name}"
+        directory = _pool(_storage_base(self.runtime)) / f"cap-{name}"
         directory.mkdir(exist_ok=True)
         got: list[io.FileIO] = []
         ticket: list[io.TextIOWrapper] = []  # this holder's place in the queue while it waits: held locked while alive
@@ -1020,11 +1022,13 @@ class Grant:
 class Admission:
     """Class FIFO admission on the SAME slot files as Slots and its make jobserver.
 
+    The root is the host runtime's declared cache.dir, shared with native Slots.
     Values are explicit Policy data. Releases, queue changes and holder death wake
     waiters; no timer retries admission. Resource refusal precedes queueing.
     """
 
-    def __init__(self, policy: Policy) -> None:
+    def __init__(self, policy: Policy, *, runtime: runtime_file.Runtime | None = None) -> None:
+        self.runtime = runtime
         self.policy = policy
         self._local = threading.local()
         self.CANCEL = None
@@ -1034,7 +1038,7 @@ class Admission:
         self.policy = Policy(**values)
 
     def pool_dir(self) -> Path:
-        return _pool(_runtime_base())
+        return _pool(_storage_base(self.runtime or default.runtime))
 
     @staticmethod
     def _mem_gib(field: str) -> float:
@@ -1072,13 +1076,17 @@ class Admission:
         return self.capacity() if klass in CLASSES[:2] else max(1, self.capacity() // self.stamp_slots())
 
     def check_disk(self, klass: str, weight: int) -> None:
-        need = self.policy.disk_gib * weight
-        free = self.disk_free_gib()
+        if klass not in CLASSES or weight < 1:
+            raise ValueError("known class and positive slot weight required")
+        root = self.pool_dir()
+        need = self.policy.disk_gib * weight * 2**30
+        free = self.disk_free_gib() * 2**30
         if klass != "owner" and free < need:
             raise AdmissionError(
                 "slots.disk_floor",
-                f"{free:.1f} GiB free; {weight} slots need {need:.1f} GiB; refused before work to prevent ENOSPC",
-                "free disk or correct caller policy",
+                f"root={root}; free={free:.0f} bytes; needed={need:.0f} bytes for {weight} slots; "
+                "refused before work to prevent ENOSPC",
+                "free storage at root or declare runtime.cache.dir on a filesystem sized for the requested slots",
             )
 
     _queue = staticmethod(Slots._queue)
