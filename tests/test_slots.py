@@ -9,8 +9,12 @@ import contextlib
 import fcntl
 import multiprocessing
 import os
+import select
+import subprocess
+import sys
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -42,10 +46,10 @@ def pool(rundir: Path) -> Path:
 
 
 def test_the_wire_protocol_constants_and_file_formats_are_frozen(rundir, make_runtime, tmp_path):
-    assert (slots.PROTOCOL, slots.POOL, slots.WAITS) == (2, "unbake-pool-2", "waits.jsonl")
+    assert (slots.PROTOCOL, slots.POOL, slots.WAITS) == (3, "unbake-pool-3", "waits.jsonl")
     assert (slots.CORES_ENV, slots.DEAD_AFTER) == ("UNBAKE_CORES", 60.0)
     assert (slots._IN_CHANGES, slots._IN_FLAGS) == (0x8 | 0x80 | 0x100 | 0x200, 0o4000 | 0o2000000)
-    assert slots.wait_log() == rundir / "unbake-pool-2" / "waits.jsonl"
+    assert slots.wait_log() == rundir / "unbake-pool-3" / "waits.jsonl"
     mine = slots.Slots(make_runtime(workers=4))
     with mine.cores(3) as granted:
         files = sorted(p.name for p in (rundir / slots.POOL).iterdir())
@@ -258,23 +262,39 @@ class TestCapacities:
 
 
 def test_a_protocol_nobody_runs_any_more_costs_no_wait(rundir, make_runtime):
-    other = rundir / "unbake-pool-1"
+    other = rundir / "unbake-pool-2"
     other.mkdir()
     (other / "cmd-1.lock").write_text("1 1")  # nobody holds it
     with slots.Slots(make_runtime(workers=2)).cores() as granted:
         assert granted == 2
 
 
-def test_a_command_waits_for_live_commands_of_another_slot_protocol_to_release(rundir, make_runtime, tmp_path):
-    other = rundir / "unbake-pool-1"
+def test_a_command_waits_for_live_commands_of_another_slot_protocol_to_release(
+    rundir, make_runtime, tmp_path, monkeypatch
+):
+    other = rundir / "unbake-pool-2"
     other.mkdir()
     peer = hold(other / "cmd-1.lock", "1 1")
-    threading.Timer(0.3, drop, [peer]).start()
+    draining = threading.Event()
+    original = slots._drain
+
+    def drain(base):
+        draining.set()
+        original(base)
+
+    def release():
+        draining.wait()
+        drop(peer)
+
+    monkeypatch.setattr(slots, "_drain", drain)
+    releaser = threading.Thread(target=release)
+    releaser.start()
     mine = slots.Slots(make_runtime(workers=2))
     with stages.command("tool", "work", [], tmp_path / "stages.jsonl"), stages.capture() as records, mine.cores() as n:
         assert n == 2
+    releaser.join()
     waits = [r for r in records if r.path[-1] == "pool.protocol"]
-    assert len(waits) == 1 and "another slot protocol than 2" in waits[0].findings[0]["reason"]
+    assert len(waits) == 1 and "another slot protocol than 3" in waits[0].findings[0]["reason"]
 
 
 def test_a_held_slot_shows_up_as_its_own_wait_stage_naming_the_holders(pool, make_runtime, tmp_path):
@@ -603,3 +623,80 @@ def test_the_default_wait_log_is_the_hosts_and_names_the_project(rundir, make_ru
         stages.waited(61.0, "slots", "held by 42")
     (line,) = [json.loads(row) for row in slots.wait_log().read_text().splitlines()]
     assert (line["project"], line["what"], line["detail"]) == ("proj", "slots", "held by 42")
+
+
+def test_public_slots_refuses_a_relative_cache_root(make_runtime):
+    runtime = replace(make_runtime(), cache_dir=Path("relative-cache"))
+    with (
+        pytest.raises(ValueError, match="runtime.cache.dir must be an absolute storage path"),
+        slots.Slots(runtime).cores(),
+    ):
+        pytest.fail("a relative root admitted work")
+
+
+@pytest.mark.parametrize(("budget", "exit_holder"), [(8, False), (4, False), (4, True)])
+def test_library_and_cli_share_declared_locks_across_xdg_roots(
+    rundir, make_runtime, tmp_path, budget, exit_holder
+):
+    """Real library/CLI processes share locks; pipe, inotify and child exit order the proof, never durations."""
+    make_runtime(workers=budget)
+    old_root = tmp_path / "old-xdg"
+    old_pool = old_root / "unbake-pool-2"
+    old_pool.mkdir(parents=True)
+    old = hold(old_pool / "cmd-1.lock", "4 4")
+    other_xdg = tmp_path / "other-xdg"
+    other_xdg.mkdir()
+    holder_code = (
+        "import sys; from abucache.slots import Slots; "
+        "pool = Slots(); grant = pool.cores(4); "
+        "print(grant.__enter__(), flush=True); sys.stdin.readline(); grant.__exit__(None, None, None)"
+    )
+    child_code = "import sys; print(sys.argv[1], flush=True); sys.stdin.readline()"
+    holder = subprocess.Popen(
+        [sys.executable, "-c", holder_code], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+        env={**os.environ, "XDG_RUNTIME_DIR": str(old_root)},
+    )
+    waiter = None
+    watch = None
+    try:
+        assert holder.stdout.readline().strip() == "4"
+        pool = rundir / "unbake-pool-3"
+        watch = slots._inotify(pool)
+        waiter = subprocess.Popen(
+            [sys.executable, "-m", "abucache.slots", "--work", "4", "--",
+             sys.executable, "-c", child_code, "{j}"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+            env={**os.environ, "XDG_RUNTIME_DIR": str(other_xdg)},
+        )
+        if budget == 4:
+            # The durable queue entry proves the CLI reached admission while the library owns the entire budget.
+            while not list(pool.glob("wait-*")):
+                ready, _, _ = select.select([watch, waiter.stdout], [], [])
+                assert waiter.stdout not in ready, "CLI ran before the held budget was released"
+                os.read(watch, 65536)
+            held = [p for p in pool.glob("slot-*.lock") if slots._busy(p)]
+            assert len(held) == budget
+            if exit_holder:
+                holder.kill()
+                assert holder.wait() < 0
+            else:
+                holder.communicate("release\n")
+                assert holder.returncode == 0
+        grant = int(waiter.stdout.readline())
+        held = [p for p in pool.glob("slot-*.lock") if slots._busy(p)]
+        assert grant == 4
+        assert len(held) == budget
+        assert grant + (4 if budget == 8 else 0) == budget
+        assert list(old_pool.iterdir()) == [old_pool / "cmd-1.lock"]
+        assert not list(other_xdg.iterdir())
+        assert not (old_root / slots.POOL).exists()
+        waiter.communicate("release\n")
+        assert waiter.returncode == 0
+    finally:
+        if watch is not None:
+            os.close(watch)
+        for process in (waiter, holder):
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.wait()
+        drop(old)

@@ -3,7 +3,7 @@
 """The host's worker slots: every heavy thing on a machine takes its share of the cores from one set of flock files,
 so commands of any tool divide the machine fairly instead of each assuming it owns it.
 
-Wire protocol 2 (frozen): `<runtime.cache.dir>/unbake-pool-2/` holds `slot-<n>.lock` (one flock per core),
+Wire protocol 3 (frozen): `<runtime.cache.dir>/unbake-pool-3/` holds `slot-<n>.lock` (one flock per core),
 `slot-express.lock` (one slot beyond the budget, for a command with at most `EXPRESS_AT` chunks), `cmd-<pid>.lock` (a
 live command, holding its demand, its budget and a trailing `p` for the priority job), `wait-<rank><ns>-<pid>` (the
 queue for a free slot; rank 0 is the priority job's, 1 everyone else's), `wake` (the one file whose write-close wakes
@@ -45,7 +45,7 @@ from pathlib import Path
 from abucache import runtime as runtime_file
 from abucache import stages
 
-PROTOCOL = 2  # the host slot protocol: a command of any other one books other files, so it never runs beside this one
+PROTOCOL = 3  # identifies both the declared-storage root and the lock format; foreign pools here drain first
 POOL = f"unbake-pool-{PROTOCOL}"  # the slot directory of this protocol, under the declared runtime cache directory
 WAITS = "waits.jsonl"  # in the slot directory: one line per wait of 60 s or more (stages.WAIT_NOTE), whoever waited
 CORES_ENV = "UNBAKE_CORES"  # the cores a holder above this process took for the command
