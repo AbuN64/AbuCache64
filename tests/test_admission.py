@@ -6,6 +6,7 @@ import json
 import os
 import threading
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -18,7 +19,7 @@ from abucache import slots
 def admission(rundir, monkeypatch):
     result = slots.Admission(slots.Policy(0, 4, 40, 0.75, 5, 2))
     monkeypatch.setattr(result, "_mem_gib", lambda field: 128)
-    monkeypatch.setattr(result, "disk_free_gib", lambda: 1024)
+    monkeypatch.setattr(result, "disk_free_gib", lambda output_dir: 1024)
     monkeypatch.setattr(os, "sched_getaffinity", lambda pid: set(range(8)))
     monkeypatch.delenv(slots.CORES_ENV, raising=False)
     return result
@@ -44,29 +45,29 @@ def test_class_order_and_fifo_share_the_native_queue(admission):
 
 def test_disk_and_memory_refuse_before_queue_or_work(admission, monkeypatch):
     pool = admission.pool_dir()
-    monkeypatch.setattr(admission, "disk_free_gib", lambda: 70)
-    with pytest.raises(slots.AdmissionError, match="disk_floor"), admission.hold("batch", 2):
+    monkeypatch.setattr(admission, "disk_free_gib", lambda output_dir: 70)
+    with pytest.raises(slots.AdmissionError, match="disk_floor"), admission.hold("batch", 2, output_dir=Path.cwd()):
         pytest.fail("work started without disk")
     assert not list(pool.glob("admit-*"))
-    monkeypatch.setattr(admission, "disk_free_gib", lambda: 1024)
+    monkeypatch.setattr(admission, "disk_free_gib", lambda output_dir: 1024)
     monkeypatch.setattr(admission, "_mem_gib", lambda field: 8 if field == "MemAvailable" else 128)
-    with pytest.raises(slots.AdmissionError, match="memory"), admission.hold("batch", mem_gib=5):
+    with pytest.raises(slots.AdmissionError, match="memory"), admission.hold("batch", mem_gib=5, output_dir=Path.cwd()):
         pytest.fail("work started without memory")
     assert not list(pool.glob("admit-*"))
     monkeypatch.setattr(os, "sched_setaffinity", lambda *args: None)
-    with admission.hold("owner", mem_gib=5) as grant:
+    with admission.hold("owner", mem_gib=5, output_dir=Path.cwd()) as grant:
         assert grant.weight == 1
 
 
 def test_memory_reservation_is_atomic_between_grants(admission, monkeypatch):
     monkeypatch.setattr(admission, "_mem_gib", lambda field: 14 if field == "MemAvailable" else 128)
-    first = admission.acquire("batch", mem_gib=5)
+    first = admission.acquire("batch", mem_gib=5, output_dir=Path.cwd())
     try:
         with pytest.raises(slots.AdmissionError, match="memory"):
-            admission.acquire("batch", mem_gib=5.5)
+            admission.acquire("batch", mem_gib=5.5, output_dir=Path.cwd())
     finally:
         first.release()
-    second = admission.acquire("batch", mem_gib=5.5)
+    second = admission.acquire("batch", mem_gib=5.5, output_dir=Path.cwd())
     second.release()
 
 
@@ -75,10 +76,10 @@ def test_completion_and_failure_release_slots_and_affinity(admission, monkeypatc
     affinity = mock.Mock()
     monkeypatch.setattr(os, "sched_setaffinity", affinity)
     try:
-        with admission.hold("batch", 2) as grant:
+        with admission.hold("batch", 2, output_dir=Path.cwd()) as grant:
             assert grant.numbers == {0, 1}
             assert slots._busy(admission.pool_dir() / "slot-0.lock")
-            with admission.hold("background") as nested:
+            with admission.hold("background", output_dir=Path.cwd()) as nested:
                 assert nested is None
             if fail:
                 raise RuntimeError("work failed")
@@ -91,14 +92,14 @@ def test_completion_and_failure_release_slots_and_affinity(admission, monkeypatc
 
 def test_pin_failure_also_releases(admission, monkeypatch):
     monkeypatch.setattr(os, "sched_setaffinity", mock.Mock(side_effect=OSError("pin refused")))
-    with pytest.raises(OSError, match="pin refused"), admission.hold("batch"):
+    with pytest.raises(OSError, match="pin refused"), admission.hold("batch", output_dir=Path.cwd()):
         pytest.fail("work started without affinity")
     assert not slots._busy(admission.pool_dir() / "slot-0.lock")
 
 
 def test_release_wakes_a_waiter_without_a_timer(admission, monkeypatch):
     monkeypatch.setattr(admission, "capacity", lambda: 1)
-    first = admission.acquire("batch")
+    first = admission.acquire("batch", output_dir=Path.cwd())
     sleeping = threading.Event()
     granted = threading.Event()
     real_select = slots.select.select
@@ -111,7 +112,7 @@ def test_release_wakes_a_waiter_without_a_timer(admission, monkeypatch):
     monkeypatch.setattr(slots.select, "select", select_on_release)
 
     def work():
-        second = admission.acquire("batch")
+        second = admission.acquire("batch", output_dir=Path.cwd())
         granted.set()
         second.release()
 
@@ -128,7 +129,7 @@ def test_native_slots_and_class_admission_use_identical_locks(admission, make_ru
     native = slots.Slots(make_runtime(workers=2))
     with native.cores(2) as count:
         assert count == 2
-        grant = admission.acquire("interactive")
+        grant = admission.acquire("interactive", output_dir=Path.cwd())
         try:
             assert grant.numbers == {2}
         finally:
@@ -148,7 +149,7 @@ def test_declared_values_validate_and_stamp_width_uses_them(admission):
 
 
 def test_holder_metadata_exposes_the_declared_memory_and_pid(admission):
-    grant = admission.acquire("background", label="work", mem_gib=5)
+    grant = admission.acquire("background", label="work", mem_gib=5, output_dir=Path.cwd())
     try:
         assert json.loads(grant.holder.read_text()) == {
             "pid": os.getpid(),
@@ -165,7 +166,7 @@ def test_holder_metadata_exposes_the_declared_memory_and_pid(admission):
 def test_real_waiters_grant_in_class_order(admission, monkeypatch):
     monkeypatch.setattr(admission, "capacity", lambda: 1)
     monkeypatch.setattr(os, "sched_getaffinity", lambda pid: {0})
-    first = admission.acquire("batch")
+    first = admission.acquire("batch", output_dir=Path.cwd())
     queued = {klass: threading.Event() for klass in slots.CLASSES}
     start = threading.Event()
     order = []
@@ -179,7 +180,7 @@ def test_real_waiters_grant_in_class_order(admission, monkeypatch):
     monkeypatch.setattr(slots, "_until", until)
 
     def work(klass):
-        grant = admission.acquire(klass)
+        grant = admission.acquire(klass, output_dir=Path.cwd())
         order.append(klass)
         grant.release()
 
@@ -197,9 +198,9 @@ def test_real_waiters_grant_in_class_order(admission, monkeypatch):
 
 
 def test_status_exposes_live_holders_to_consumers(admission):
-    grant = admission.acquire("batch", 2, "build")
+    grant = admission.acquire("batch", 2, "build", output_dir=Path.cwd())
     try:
-        status = admission.status()
+        status = admission.status(output_dir=Path.cwd())
         assert status["used"] == 2
         assert status["queue"] == []
         assert status["holders"] == [
@@ -207,7 +208,7 @@ def test_status_exposes_live_holders_to_consumers(admission):
         ]
     finally:
         grant.release()
-    assert admission.status()["holders"] == []
+    assert admission.status(output_dir=Path.cwd())["holders"] == []
 
 
 def test_ticket_publication_cannot_be_deleted_by_a_competing_census(admission, monkeypatch):
@@ -224,11 +225,11 @@ def test_ticket_publication_cannot_be_deleted_by_a_competing_census(admission, m
         return real_try(path)
 
     monkeypatch.setattr(slots, "_try", competing)
-    grant = admission.acquire("batch")
+    grant = admission.acquire("batch", output_dir=Path.cwd())
     try:
         assert len(prepared) == 1
         assert not prepared[0].exists()
-        assert admission.status()["holders"][0]["slots"] == [0]
+        assert admission.status(output_dir=Path.cwd())["holders"][0]["slots"] == [0]
     finally:
         grant.release()
 
@@ -240,9 +241,9 @@ def test_ticket_publication_cannot_be_deleted_by_a_competing_census(admission, m
 def test_disk_floor_counts_only_requested_slots(admission, monkeypatch, weight, free_gib, accepted):
     """The 09XN host had 4.7 GiB free and a 40 GiB floor per requested slot."""
     free_bytes = int(free_gib * 2**30)
-    monkeypatch.setattr(admission, "disk_free_gib", lambda: free_bytes / 2**30)
+    monkeypatch.setattr(admission, "disk_free_gib", lambda output_dir: free_bytes / 2**30)
     if accepted:
-        grant = admission.acquire("batch", weight)
+        grant = admission.acquire("batch", weight, output_dir=Path.cwd())
         try:
             assert grant.weight == weight
             assert len(grant.numbers) == weight
@@ -250,9 +251,9 @@ def test_disk_floor_counts_only_requested_slots(admission, monkeypatch, weight, 
             grant.release()
     else:
         with pytest.raises(slots.AdmissionError) as caught:
-            admission.acquire("batch", weight)
+            admission.acquire("batch", weight, output_dir=Path.cwd())
         assert caught.value.key == "slots.disk_floor"
-        assert f"root={admission.pool_dir()}" in caught.value.detail
+        assert f"root={Path.cwd()}" in caught.value.detail
         assert f"free={free_bytes} bytes" in caught.value.detail
         assert f"needed={40 * weight * 2**30} bytes for {weight} slots" in caught.value.detail
         assert not list(admission.pool_dir().glob("admit-*"))
@@ -272,12 +273,13 @@ def test_admission_measures_declared_storage_not_runtime_tmpfs(rundir, make_runt
         measured.append(path)
         # The configured storage fits one slot; the runtime tmpfs does not.
         return SimpleNamespace(
-            f_bavail=40 * 2**30 if path.is_relative_to(rundir) else int(4.7 * 2**30), f_frsize=1,
+            f_bavail=40 * 2**30 if path == Path.cwd() else int(4.7 * 2**30),
+            f_frsize=1,
         )
 
     monkeypatch.setattr(os, "statvfs", statvfs)
-    admission.check_disk("batch", 1)
-    assert measured == [rundir / slots.POOL]
+    admission.check_disk("batch", 1, output_dir=Path.cwd())
+    assert measured == [Path.cwd()]
     assert not list(transient.iterdir())
     monkeypatch.delenv("XDG_RUNTIME_DIR")
     assert admission.pool_dir() == rundir / slots.POOL
@@ -289,7 +291,7 @@ def test_missing_storage_declaration_does_not_fall_back_to_runtime_tmpfs(rundir,
     monkeypatch.setenv("ABU_RUNTIME", str(tmp_path / "missing.toml"))
     admission = slots.Admission(slots.Policy(0, 4, 40, 0.75, 5, 2))
     with pytest.raises(slots.runtime_file.RuntimeConfigError):
-        admission.acquire("batch")
+        admission.acquire("batch", output_dir=Path.cwd())
     assert not list((tmp_path / "run").iterdir())
 
 
@@ -301,3 +303,43 @@ def test_relative_storage_root_is_refused(make_runtime):
     )
     with pytest.raises(ValueError, match="absolute storage path"):
         admission.pool_dir()
+
+
+def test_output_filesystem_admission_and_refusal(admission, monkeypatch, tmp_path):
+    output = tmp_path / "output"
+    output.mkdir()
+    pool = admission.pool_dir()
+    measured = []
+    free = 491
+
+    def statvfs(path):
+        measured.append(path)
+        return SimpleNamespace(f_bavail=int((free if path == output else 4.7) * 2**30), f_frsize=1)
+
+    monkeypatch.setattr(os, "statvfs", statvfs)
+    monkeypatch.setattr(admission, "disk_free_gib", slots.Admission.disk_free_gib.__get__(admission))
+    grant = admission.acquire("batch", output_dir=output)
+    grant.release()
+    assert measured == [output, output]
+    assert pool not in measured
+    free = 4.7
+    with pytest.raises(slots.AdmissionError, match="slots.disk_floor") as caught:
+        admission.acquire("batch", output_dir=output)
+    assert str(output) in caught.value.detail
+    assert not list(pool.glob("admit-*"))
+    with pytest.raises(slots.AdmissionError, match="output directory is required"):
+        admission.acquire("batch")
+
+
+def test_output_directory_before_creation(admission, monkeypatch, tmp_path):
+    monkeypatch.setattr(admission, "disk_free_gib", slots.Admission.disk_free_gib.__get__(admission))
+    with mock.patch.object(os, "statvfs", return_value=SimpleNamespace(f_bavail=491, f_frsize=2**30)) as stat:
+        admission.check_disk("batch", 1, output_dir=tmp_path / "new" / "run")
+    stat.assert_called_once_with(tmp_path)
+    assert not (tmp_path / "new").exists()
+
+
+def test_nested_hold_requires_output_directory(admission, monkeypatch):
+    monkeypatch.setenv(slots.CORES_ENV, "1")
+    with pytest.raises(slots.AdmissionError, match="output directory is required"), admission.hold("batch"):
+        pytest.fail("nested work must name its output")

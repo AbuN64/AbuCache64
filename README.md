@@ -45,8 +45,8 @@ abucache is refused with this package named as its owner.
 Class admission uses `abucache.slots.Admission(Policy(...))`, on the same slot
 files as `Slots`. All six Policy fields are caller-declared: `reserve_cores`,
 `floor_gib`, `disk_gib`, `rss_gib`, `stamp_gib`, `stamp_jobs`. `hold(class, weight,
-label, mem_gib=...)` guards work, releases on every exit and pins the calling
-thread and its children to the granted cores. `admitted(class)` guards functions.
+label, mem_gib=..., output_dir=...)` guards work, releases on every exit and pins the calling
+thread and its children to the granted cores. `admitted(class, output_dir=resolver)` guards functions.
 Classes order owner, interactive, batch, background, with FIFO within each class.
 Owner may use reserve cores and bypass resource floors. Other requests refuse
 before work if their declared memory or disk cannot fit. Waits use queue/release
@@ -60,3 +60,10 @@ and invalid inherited widths refuse rather than silently creating another parall
 Generated make uses `--make-parent <pid>` to retain its original argument list, including options GNU make omits
 from MAKEFLAGS. Directory changes are already applied; unadmitted width flags are removed. The generated delegate
 preserves MAKELEVEL so existing top-level maintenance and recursive build behavior keep their meaning.
+
+Disk admission requires an explicit `output_dir` on `acquire`, `hold`,
+`check_disk` and `status`; `admitted` takes a callable resolving the directory
+from the wrapped arguments. Missing directories are measured at their nearest
+existing ancestor, without creating output. Missing declarations refuse.
+This preflight guards available output storage against ENOSPC, separately from
+Terminal's host-pressure admission; lock storage does not measure output space.

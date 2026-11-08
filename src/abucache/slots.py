@@ -1047,8 +1047,17 @@ class Admission:
                 return int(line.split()[1]) / 1048576
         raise AdmissionError("slots.memory", f"missing {field}")
 
-    def disk_free_gib(self) -> float:
-        usage = os.statvfs(self.pool_dir())
+    def disk_free_gib(self, output_dir: Path | None = None) -> float:
+        """Available space on the output filesystem, including before its directory is created."""
+        if output_dir is None:
+            raise AdmissionError("slots.disk_directory", "output directory is required")
+        root = Path(output_dir).resolve()
+        existing = root
+        while not existing.exists() and existing != existing.parent:
+            existing = existing.parent
+        if not existing.is_dir():
+            raise AdmissionError("slots.disk_directory", f"output directory is not a directory: {root}")
+        usage = os.statvfs(existing)
         return usage.f_bavail * usage.f_frsize / 2**30
 
     def capacity(self) -> int:
@@ -1075,30 +1084,40 @@ class Admission:
     def stamp_weight(self, klass: str = "batch") -> int:
         return self.capacity() if klass in CLASSES[:2] else max(1, self.capacity() // self.stamp_slots())
 
-    def check_disk(self, klass: str, weight: int) -> None:
+    def check_disk(self, klass: str, weight: int, *, output_dir: Path | None = None) -> None:
         if klass not in CLASSES or weight < 1:
             raise ValueError("known class and positive slot weight required")
-        root = self.pool_dir()
+        if output_dir is None:
+            raise AdmissionError("slots.disk_directory", "output directory is required")
+        root = Path(output_dir).resolve()
         need = self.policy.disk_gib * weight * 2**30
-        free = self.disk_free_gib() * 2**30
+        free = self.disk_free_gib(output_dir) * 2**30
         if klass != "owner" and free < need:
             raise AdmissionError(
                 "slots.disk_floor",
                 f"root={root}; free={free:.0f} bytes; needed={need:.0f} bytes for {weight} slots; "
                 "refused before work to prevent ENOSPC",
-                "free storage at root or declare runtime.cache.dir on a filesystem sized for the requested slots",
+                "free storage at the output directory or choose an output filesystem sized for the requested slots",
             )
 
     _queue = staticmethod(Slots._queue)
 
-    def acquire(self, klass: str, weight: int = 1, label: str = "", *, mem_gib: float | None = None) -> Grant:
+    def acquire(
+        self,
+        klass: str,
+        weight: int = 1,
+        label: str = "",
+        *,
+        mem_gib: float | None = None,
+        output_dir: Path | None = None,
+    ) -> Grant:
         if klass not in CLASSES or weight < 1:
             raise ValueError("known class and positive slot weight required")
         pool = self.pool_dir()
         limit = len(os.sched_getaffinity(0)) if klass == "owner" else self.capacity()
         if weight > limit:
             raise AdmissionError("slots.capacity", f"{weight} slots exceed capacity {limit}")
-        self.check_disk(klass, weight)
+        self.check_disk(klass, weight, output_dir=output_dir)
         need = mem_gib if mem_gib is not None else weight * self.policy.rss_gib
         if need < 0:
             raise ValueError("memory need must be nonnegative")
@@ -1134,7 +1153,7 @@ class Admission:
             try:
                 if self._queue(pool)[0] != ticket:
                     return False
-                self.check_disk(klass, weight)
+                self.check_disk(klass, weight, output_dir=output_dir)
                 promised = 0.0
                 for path in pool.glob("holder-*.lock"):
                     if _busy(path):
@@ -1201,11 +1220,20 @@ class Admission:
         return before
 
     @contextmanager
-    def hold(self, klass: str = "batch", weight: int = 1, label: str = "", *, mem_gib: float | None = None):
+    def hold(
+        self,
+        klass: str = "batch",
+        weight: int = 1,
+        label: str = "",
+        *,
+        mem_gib: float | None = None,
+        output_dir: Path | None = None,
+    ):
         if getattr(self._local, "depth", 0) or os.environ.get(CORES_ENV):
+            self.check_disk(klass, weight, output_dir=output_dir)
             yield None
             return
-        grant = self.acquire(klass, weight, label, mem_gib=mem_gib)
+        grant = self.acquire(klass, weight, label, mem_gib=mem_gib, output_dir=output_dir)
         before = None
         self._local.depth = 1
         try:
@@ -1219,11 +1247,11 @@ class Admission:
             finally:
                 grant.release()
 
-    def admitted(self, klass: str, weight: int = 1):
+    def admitted(self, klass: str, weight: int = 1, *, output_dir: Callable[..., Path]):
         def decorate(fn):
             @functools.wraps(fn)
             def wrapped(*args, **kwargs):
-                with self.hold(klass, weight, fn.__name__):
+                with self.hold(klass, weight, fn.__name__, output_dir=output_dir(*args, **kwargs)):
                     return fn(*args, **kwargs)
 
             return wrapped
@@ -1241,13 +1269,13 @@ class Admission:
                 continue
         return rows
 
-    def status(self) -> dict:
+    def status(self, *, output_dir: Path | None = None) -> dict:
         pool = self.pool_dir()
         return {
             "capacity": self.capacity(),
             "stamp_slots": self.stamp_slots(),
             "disk_gib": self.policy.disk_gib,
-            "disk_free_gib": self.disk_free_gib(),
+            "disk_free_gib": self.disk_free_gib(output_dir),
             "mem_floor_gib": self.policy.floor_gib,
             "queue": [
                 {"ticket": p.name, **json.loads(p.read_text())}
