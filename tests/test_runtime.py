@@ -199,3 +199,87 @@ def test_auto_workers_are_limited_by_memory_and_never_below_one(
 
 def test_usable_memory_is_positive() -> None:
     assert runtime._usable_memory() > 0
+
+
+def _provision_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    for name in ("ABU_RUNTIME", "XDG_CACHE_HOME", "XDG_STATE_HOME"):
+        monkeypatch.delenv(name, raising=False)
+    return tmp_path / ".config" / "abu" / "runtime.toml"
+
+
+def test_a_host_with_no_file_gets_one_that_loads_with_every_value_derived(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = _provision_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(runtime, "_usable_memory", lambda: 64 << 30)
+    monkeypatch.setattr(os, "sched_getaffinity", lambda _pid: set(range(8)))
+    assert runtime.provision() == (target, True)
+    assert not any(ch.isdigit() for ch in target.read_text().replace(str(tmp_path), ""))  # no literal number
+    value = runtime.load()
+    assert (value.cores, value.worker_memory) == (8, 8 << 30)
+    assert (value.parent_memory, value.reserve_memory) == (16 << 30, 8 << 30)
+    assert value.workers == 6  # (64 - 16) GiB // 8 GiB
+    assert value.cache_dir == tmp_path / ".cache" / "abu" / "cache"
+    assert value.feed == tmp_path / ".local/state/abu/feed.jsonl"
+    assert value.cache_bytes > 0 and value.overrun_percent == runtime.POLICY["events.overrun_percent"]
+
+
+def test_the_derived_values_follow_the_host_at_each_load(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    target = _provision_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(runtime, "_usable_memory", lambda: 16 << 30)
+    runtime.provision()
+    before = runtime.load()
+    monkeypatch.setattr(runtime, "_usable_memory", lambda: 32 << 30)
+    after = runtime.load(target)
+    assert after.parent_memory == 2 * before.parent_memory and after.digest != before.digest
+
+
+def test_an_existing_file_stays_untouched(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    target = _provision_env(tmp_path, monkeypatch)
+    target.parent.mkdir(parents=True)
+    target.write_text("operator wrote this\n")
+    assert runtime.provision() == (target, False)
+    assert target.read_text() == "operator wrote this\n"
+
+
+def test_an_underivable_host_is_refused_once_naming_each_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    target = _provision_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(runtime, "_usable_memory", lambda: -1)
+
+    def no_home() -> Path:
+        raise RuntimeError("no home")
+
+    monkeypatch.setattr(Path, "home", no_home)
+    with pytest.raises(runtime.RuntimeConfigError) as caught:
+        runtime.provision(target)
+    assert caught.value.file == str(target)
+    assert caught.value.key.split(", ") == [
+        "resources.worker_memory",
+        "resources.parent_memory",
+        "resources.reserve_memory",
+        "cache.dir",
+        "events.feed",
+    ]
+    assert not target.exists()
+
+
+def test_an_auto_memory_the_host_cannot_answer_is_refused_naming_the_keys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    text = _text(tmp_path).replace("worker_memory = 1073741824", 'worker_memory = "auto"')
+    text = text.replace("reserve_memory = 536870912", 'reserve_memory = "auto"')
+    path = _file(tmp_path, text)
+    monkeypatch.setattr(runtime, "_usable_memory", lambda: 0)
+    with pytest.raises(runtime.RuntimeConfigError) as caught:
+        runtime.load(path)
+    assert caught.value.key == "resources.worker_memory, resources.reserve_memory"
+
+
+def test_the_main_entry_prints_what_it_did(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    target = _provision_env(tmp_path, monkeypatch)
+    assert runtime.main(["provision"]) == 0 and capsys.readouterr().out == f"wrote {target}\n"
+    assert runtime.main(["provision"]) == 0 and capsys.readouterr().out == f"kept {target}\n"
+    assert runtime.main([]) == 2
