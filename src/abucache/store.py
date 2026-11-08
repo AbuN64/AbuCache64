@@ -23,6 +23,8 @@ from typing import TypeVar
 
 import diskcache
 
+from abucache import runtime
+
 log = logging.getLogger("abucache")
 
 _MANIFEST = "manifest:"
@@ -36,7 +38,6 @@ DISK_FULL = 0.8  # fraction of the disk used above which the size backstop acts
 KEEP_COMMITS = 20
 KEEP_SECONDS = 7 * 24 * 3600  # a root without git history keeps its entries live this long (runtime cache.keep_seconds)
 BATCH = 10_000
-WORKERS = os.cpu_count() or 1
 BACKSTOP_BATCH = 500  # the backstop checks the volume after every batch, so it stops close to its target
 TARGET = 0.9  # the backstop deletes down to this fraction of size_limit
 
@@ -215,7 +216,7 @@ class ContentCache:
             group = (body["root"], body["identity"])
             newest[group] = max(newest.get(group, (0.0, "", "")), (body["at"], body["tree"], name))
         roots = sorted({body["root"] for body in manifests.values() if Path(body["root"]).is_dir()})
-        with ThreadPoolExecutor(WORKERS) as pool:  # each root is a few git processes
+        with ThreadPoolExecutor(runtime.admitted_jobs()) as pool:  # each root is a few git processes
             trees = dict(zip(roots, pool.map(lambda root: _live_trees(Path(root), keep_commits), roots), strict=True))
         alive_code: dict[str, bool] = {}
         live: set[str] = set()
@@ -275,7 +276,7 @@ class ContentCache:
         many went. A row stored again since the scan has a new store_time and stays. Value files go after each batch
         commits, on every core."""
         count = 0
-        with ThreadPoolExecutor(WORKERS) as pool:
+        with ThreadPoolExecutor(runtime.admitted_jobs()) as pool:
             for start in range(0, len(rows), BATCH):
                 batch = rows[start : start + BATCH]
                 files: list[str] = []

@@ -171,19 +171,46 @@ def test_an_unreadable_or_invalid_file_is_refused_by_file(tmp_path: Path) -> Non
     assert _refused(tmp_path, "[resources\n").key == ""
 
 
-def test_auto_cores_is_the_affinity_and_auto_workers_the_smaller_of_it_and_cores(
+def test_auto_widths_are_at_most_the_admitted_jobs_and_auto_workers_at_most_cores(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: set(range(6)))
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: set(range(64)))  # 64 CPUs derive, JOBS caps
     monkeypatch.setattr(runtime, "_usable_memory", lambda: 1 << 40)
+    monkeypatch.setenv("JOBS", "6")
     both = _text(tmp_path).replace("cores = 8", 'cores = "auto"').replace("workers = 4", 'workers = "auto"')
     value = runtime.load(_file(tmp_path, both))
     assert (value.cores, value.workers) == (6, 6)
     only_workers = _text(tmp_path).replace("workers = 4", 'workers = "auto"')
     value = runtime.load(_file(tmp_path, only_workers))
-    assert (value.cores, value.workers) == (8, 6)
-    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: set(range(16)))
+    assert (value.cores, value.workers) == (6, 6)  # an integer cores is at most JOBS
+    monkeypatch.setenv("JOBS", "16")
     assert runtime.load(_file(tmp_path, only_workers)).workers == 8  # never more than cores
+
+
+def test_integer_widths_are_at_most_the_admitted_jobs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: set(range(64)))
+    monkeypatch.setenv("JOBS", "4")
+    value = runtime.load(_file(tmp_path))  # cores = 8, workers = 4
+    assert (value.cores, value.workers) == (4, 4)
+    monkeypatch.setenv("JOBS", "2")
+    value = runtime.load(_file(tmp_path))
+    assert (value.cores, value.workers) == (2, 2)
+
+
+@pytest.mark.parametrize("jobs", [None, "", "0", "-3", "auto", "4.5"])
+def test_no_admitted_jobs_refuses_every_width(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, jobs: str | None
+) -> None:
+    if jobs is None:
+        monkeypatch.delenv("JOBS", raising=False)
+    else:
+        monkeypatch.setenv("JOBS", jobs)
+    with pytest.raises(runtime.RuntimeConfigError) as caught:
+        runtime.load(_file(tmp_path))
+    assert caught.value.file == "JOBS" and "admitted width" in str(caught.value)
+    with pytest.raises(runtime.RuntimeConfigError):
+        runtime.admitted_jobs()
+    assert runtime.admitted_jobs({"JOBS": "4"}) == 4
 
 
 def test_auto_workers_are_limited_by_memory_and_never_below_one(
@@ -213,7 +240,7 @@ def test_a_host_with_no_file_gets_one_that_loads_with_every_value_derived(
 ) -> None:
     target = _provision_env(tmp_path, monkeypatch)
     monkeypatch.setattr(runtime, "_usable_memory", lambda: 64 << 30)
-    monkeypatch.setattr(os, "sched_getaffinity", lambda _pid: set(range(8)))
+    monkeypatch.setattr(os, "sched_getaffinity", lambda _pid: set(range(8)))  # auto cores: the CPUs (16 admitted)
     assert runtime.provision() == (target, True)
     assert not any(ch.isdigit() for ch in target.read_text().replace(str(tmp_path), ""))  # no literal number
     value = runtime.load()

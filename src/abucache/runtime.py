@@ -112,10 +112,23 @@ def default_path() -> Path:
     return Path(env) if env else Path.home() / ".config" / "abu" / "runtime.toml"
 
 
+def admitted_jobs(environ: Mapping[str, str] | None = None) -> int:
+    """The width Terminal admission gave this process: `JOBS` (mo-terminal Admission Invoke sets it). Every width
+    abucache resolves comes from it, never from the host's CPUs: a whole-host width over-subscribes an admitted job.
+    Absent, empty or not a positive integer refuses."""
+    value = (os.environ if environ is None else environ).get("JOBS", "")
+    if not value.isdigit() or int(value) < 1:
+        raise RuntimeConfigError(
+            "JOBS", "", f"{value!r} is not an admitted width; run under Terminal admission (it sets JOBS) or set JOBS"
+        )
+    return int(value)
+
+
 def load(path: Path | None = None) -> Runtime:
     """Read and resolve the runtime file. `"auto"` for `cores` is the CPUs this process may run on; for `workers`
     it is the smaller of that and `cores`, limited by memory: (usable memory - parent_memory) // worker_memory,
-    at least 1."""
+    at least 1. Every resolved width, derived or written, is then at most the admitted JOBS; no JOBS refuses
+    (`admitted_jobs`)."""
     path = path or default_path()
     file = str(path)
     try:
@@ -146,6 +159,7 @@ def load(path: Path | None = None) -> Runtime:
         raise RuntimeConfigError(
             file, ", ".join(autos or ["resources.workers"]), "cannot be derived: this host does not report its memory"
         )
+    jobs = admitted_jobs()
     affinity = len(os.sched_getaffinity(0))
     cores = _auto(file, "resources.cores", res["cores"], lambda: affinity)
     worker_memory = _auto(file, "resources.worker_memory", res["worker_memory"], lambda: usable // cores)
@@ -161,6 +175,7 @@ def load(path: Path | None = None) -> Runtime:
         workers = _int(file, "resources.workers", res["workers"])
         if workers > cores:
             raise RuntimeConfigError(file, "resources.workers", "exceeds cores")
+    cores, workers = min(cores, jobs), min(workers, jobs)
     capacities = {name: _int(file, f"capacities.{name}", value) for name, value in document["capacities"].items()}
     directory = cache["dir"]
     if not isinstance(directory, str) or not Path(directory).is_absolute():

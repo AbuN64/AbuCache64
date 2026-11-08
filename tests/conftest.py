@@ -36,6 +36,14 @@ slow_seconds = {slow}
 overrun_percent = 150
 """
 
+ADMITTED = "16"  # the JOBS every test runs under unless it sets its own: wider than any fixture's cores
+
+
+@pytest.fixture(autouse=True)
+def _admitted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every width abucache resolves comes from the admitted JOBS (runtime.admitted_jobs); a test is admitted."""
+    monkeypatch.setenv("JOBS", ADMITTED)
+
 
 @pytest.fixture
 def rundir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:

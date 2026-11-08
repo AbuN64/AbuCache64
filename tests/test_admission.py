@@ -343,3 +343,14 @@ def test_nested_hold_requires_output_directory(admission, monkeypatch):
     monkeypatch.setenv(slots.CORES_ENV, "1")
     with pytest.raises(slots.AdmissionError, match="output directory is required"), admission.hold("batch"):
         pytest.fail("nested work must name its output")
+
+
+def test_capacity_and_the_owner_limit_are_at_most_the_admitted_jobs(admission, monkeypatch, tmp_path):
+    assert admission.capacity() == 8  # JOBS 16: the eight CPUs bound it
+    monkeypatch.setenv("JOBS", "3")
+    assert admission.capacity() == 3  # the admitted width, never the host's eight
+    with pytest.raises(slots.AdmissionError, match="slots.capacity"):
+        admission.acquire("owner", weight=4, output_dir=tmp_path)  # the owner limit is JOBS too, not the affinity
+    monkeypatch.delenv("JOBS")
+    with pytest.raises(slots.runtime_file.RuntimeConfigError):
+        admission.capacity()

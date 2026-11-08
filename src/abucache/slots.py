@@ -1061,9 +1061,12 @@ class Admission:
         return usage.f_bavail * usage.f_frsize / 2**30
 
     def capacity(self) -> int:
+        """The slots this process may hold at once: the host's CPUs less the reserve and what memory allows, at most
+        the admitted JOBS (runtime.admitted_jobs; no JOBS refuses)."""
         return max(
             1,
             min(
+                runtime_file.admitted_jobs(),
                 int(len(os.sched_getaffinity(0)) - self.policy.reserve_cores),
                 int((self._mem_gib("MemTotal") - self.policy.floor_gib) / self.policy.rss_gib),
             ),
@@ -1114,7 +1117,7 @@ class Admission:
         if klass not in CLASSES or weight < 1:
             raise ValueError("known class and positive slot weight required")
         pool = self.pool_dir()
-        limit = len(os.sched_getaffinity(0)) if klass == "owner" else self.capacity()
+        limit = runtime_file.admitted_jobs() if klass == "owner" else self.capacity()
         if weight > limit:
             raise AdmissionError("slots.capacity", f"{weight} slots exceed capacity {limit}")
         self.check_disk(klass, weight, output_dir=output_dir)
